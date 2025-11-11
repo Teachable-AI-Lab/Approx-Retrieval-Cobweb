@@ -11,7 +11,6 @@ from collections import defaultdict
 import heapq
 
 import torch
-from src.utils.constants import COBWEB_GREEDY_MODE
 from src.cobweb.CobwebTorchNode import CobwebTorchNode
 
 class CobwebTorchTreeTrunc(object):
@@ -210,11 +209,8 @@ class CobwebTorchTreeTrunc(object):
             else:
                 best1_pu, best1, best2 = current.two_best_children(instance)
 
-                if not COBWEB_GREEDY_MODE:
-                    _, best_action = current.get_best_operation(instance, best1,
-                                                                best2, best1_pu)
-                else:
-                    best_action = "new"
+                _, best_action = current.get_best_operation(instance, best1,
+                                                            best2, best1_pu)
 
                 # print(best_action)
                 if best_action == 'best':

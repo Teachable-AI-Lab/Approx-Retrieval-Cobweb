@@ -3,7 +3,6 @@ import math
 from random import random
 import uuid
 import time
-from src.utils.constants import COBWEB_GREEDY_MODE
 import torch
 
 class CobwebTorchNode(object):
@@ -408,10 +407,7 @@ class CobwebTorchNode(object):
         relative_pus.sort(reverse=True)
 
         best1 = relative_pus[0][3]
-        if COBWEB_GREEDY_MODE:
-            best1_pu = 0
-        else:
-            best1_pu = self.pu_for_insert(best1, instance)
+        best1_pu = self.pu_for_insert(best1, instance)
 
         best2 = None
         if len(relative_pus) > 1:
