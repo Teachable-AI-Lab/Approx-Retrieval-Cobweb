@@ -297,7 +297,81 @@ class CobwebTorchTree(object):
             return best if use_best else curr
         return [retrieved[i][-1] for i in range(retrieve_k)]
 
-    def categorize(self, instance, use_best=True, greedy=False, max_nodes=float('inf'), retrieve_k=None):
+    def categorize_transitions(self, instance, transition_depth, use_best=True, greedy=False, max_nodes=float('inf'), retrieve_k=None):
+        """
+        Discover and return nodes at exactly `transition_depth` in traversal order.
+
+        This is similar to the regular categorize search but will NOT
+        expand children of nodes once they are at the transition depth. The
+        returned nodes are the transition-level nodes ordered by the same
+        scoring/priority used by `_cobweb_categorize`.
+
+        Args:
+            instance: instance to score against the tree
+            transition_depth: integer depth (root==0) at which to collect nodes
+            use_best, greedy, max_nodes, retrieve_k: same semantics as categorize
+
+        Returns:
+            If retrieve_k is None: returns best node (same as categorize semantics)
+            Otherwise: returns a list of up to `retrieve_k` nodes at the transition depth
+        """
+        queue = []
+        # queue entries: (neg_score, neg_curr_ll, rand, node, depth)
+        heapq.heappush(queue, (-self.root.log_prob(instance), 0.0, random(), self.root, 0))
+        nodes_visited = 0
+
+        best = self.root
+        best_score = float('-inf')
+
+        retrieved = []
+
+        while len(queue) > 0:
+            if greedy:
+                neg_score, neg_curr_ll, _, curr, depth = queue.pop()
+            else:
+                neg_score, neg_curr_ll, _, curr, depth = heapq.heappop(queue)
+
+            score = -neg_score
+            curr_ll = -neg_curr_ll
+            nodes_visited += 1
+
+            if score > best_score:
+                best = curr
+                best_score = score
+
+            if nodes_visited >= max_nodes:
+                break
+
+            # If this node is at the transition depth and is a valid concept
+            # (has sentence_id or is a parent), collect it but DO NOT expand its children
+            if depth == transition_depth:
+                if curr.sentence_id:
+                    heapq.heappush(retrieved, (len(retrieved), random(), curr))
+                # stop expansion at this depth
+                if retrieve_k is not None and len(retrieved) == retrieve_k:
+                    break
+                continue
+
+            # Otherwise, behave like _cobweb_categorize and consider children
+            if len(curr.children) > 0:
+                add = []
+                for i, c in enumerate(curr.children):
+                    child_ll_inst = c.log_prob(instance)
+                    child_score = child_ll_inst
+                    if greedy:
+                        add.append((-child_score, score, random(), c, depth+1))
+                    else:
+                        heapq.heappush(queue, (-child_score, score, random(), c, depth+1))
+
+                if greedy:
+                    add.sort()
+                    queue.extend(add[::-1])
+
+        if retrieve_k is None:
+            return best if use_best else curr
+        return [retrieved[i][-1] for i in range(min(retrieve_k, len(retrieved)))]
+
+    def categorize(self, instance, use_best=True, greedy=False, max_nodes=float('inf'), retrieve_k=None, transition_depth=None):
         """
         Sort an instance in the categorization tree and return its resulting
         concept.
@@ -315,6 +389,16 @@ class CobwebTorchTree(object):
 
         .. seealso:: :meth:`CobwebTree.cobweb`
         """
+        # If a transition_depth is provided, use the specialized traversal
+        # that collects nodes at exactly that depth and does not expand
+        # beyond them. This is used by the wrapper to score transition-level
+        # nodes without exploring deeper leaves.
+        if transition_depth is not None:
+            if self.gradient_flow:
+                return self.categorize_transitions(instance, transition_depth, use_best, greedy, max_nodes, retrieve_k)
+            with torch.no_grad():
+                return self.categorize_transitions(instance, transition_depth, use_best, greedy, max_nodes, retrieve_k)
+
         if self.gradient_flow:
             return self._cobweb_categorize(instance, use_best, greedy, max_nodes, retrieve_k)
 

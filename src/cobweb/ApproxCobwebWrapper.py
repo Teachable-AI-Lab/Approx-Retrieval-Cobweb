@@ -9,13 +9,39 @@ import hashlib
 from graphviz import Digraph
 from src.cobweb.CobwebTorchTree import CobwebTorchTree
 
-class CobwebWrapper:
-    def __init__(self, corpus=None, corpus_embeddings=None, encode_func=lambda x: x):
+class ApproxCobwebWrapper:
+    def __init__(self, first_method:str, second_method:str, transition_depth:int=5, corpus=None, corpus_embeddings=None, encode_func=lambda x: x):
         """
-        Initializes the CobwebWrapper with optional sentences and/or embeddings.
+        Initializes the ApproxCobwebWrapper with optional sentences and/or embeddings.
+
+        Important new parameters:
+        *   first_method - can be 'bfs' or 'dfs'
+        *   second_method - can be 'pathsum' or 'dot'
+        *   transition_depth - the depth at which to collect transition nodes
+
+        The goal is that depending on the first or second method, we compute first method
+        to organize a depth of nodes by best semantic similarity and then compute second method
+        to find the best semantic similarity from just the first node.
+
+        We need to build a specific type of index for the root, as well as the nodes that describe
+        our "transition level" (k-depth or basic-level nodes; for now we use k-depth nodes). For
+        the root node, we build a search index or define the method to rank the transition level
+        nodes, while for each transition level node, we build an index or define the method to
+        rank the leaves.
+        *   'bfs' - we don't build an index, and run the Cobweb 'categorize' function without
+            the greedy argument from that node
+        *   'dfs' - we don't build an index, and run the Cobweb 'categorize' function WITH
+            the greedy argument from that node
+        *   'pathsum' - we build an index similar to how CobwebWrapper's predict-fast method works
+        *   'dot' - we build an index to do kNN with the embeddings under the given node directly
+            (defined by node.mean for those nodes)
         """
 
         self.encode_func = encode_func
+
+        self.first_method = first_method
+        self.second_method = second_method
+        self.transition_depth = transition_depth
 
         self.sentences = []
         self.sentence_to_node = {}
@@ -76,17 +102,27 @@ class CobwebWrapper:
             leaf.sentence_id.append(start_index + i)
             self.sentence_to_node[start_index + i] = leaf
 
-        # Invalidate prediction index when new sentences are added
+        # Invalidate and rebuild prediction index when new sentences are added
+        # so that query-agnostic lookup structures are ready for fast prediction.
         self._invalidate_prediction_index()
 
     def _invalidate_prediction_index(self):
         """Invalidate the prediction index when tree structure changes"""
         self._prediction_index_valid = False
-        self._index_to_node.clear()
+        # Clear mappings and cached tensors
+        try:
+            self._index_to_node.clear()
+        except Exception:
+            self._index_to_node = {}
         self._node_means = None
         self._node_vars = None
         self._leaf_to_path_indices = None
         self._path_matrix = None
+        # Clear additional cached query-agnostic structures
+        self._node_to_leaf_rows = {}
+        self._node_to_index = {}
+        self._all_transition_idxs = []
+        self._num_transitions = 0
 
     def build_prediction_index(self):
         """
@@ -155,7 +191,6 @@ class CobwebWrapper:
             level_weights = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
         else:
             level_weights = self._level_weights
-    
         
         for leaf_idx, path in enumerate(self._leaf_to_path_indices):
             path_length = len(path)
@@ -183,6 +218,15 @@ class CobwebWrapper:
         else:
             self._path_matrix = None
 
+        # Build mapping: node_idx -> list of leaf row indices for fast lookup
+        # (query-agnostic, cached here)
+        self._node_to_leaf_rows = {}
+        for leaf_idx, path in enumerate(self._leaf_to_path_indices):
+            if path is None:
+                continue
+            for node_idx in path:
+                self._node_to_leaf_rows.setdefault(node_idx, []).append(leaf_idx)
+
         # Pre-allocate tensors for means and variances
         num_nodes = idx
         self._node_means = torch.zeros(num_nodes, self.tree.shape[0], 
@@ -191,6 +235,9 @@ class CobwebWrapper:
                                     device=self.device, dtype=torch.float)
 
 
+
+        # Build reverse mapping node -> index for quick lookup
+        self._node_to_index = {n: i for i, n in self._index_to_node.items()}
 
         # Fill tensors with node statistics
         for idx, node in self._index_to_node.items():
@@ -202,97 +249,136 @@ class CobwebWrapper:
                 # Use prior variance for empty nodes
                 self._node_vars[idx] = self.tree.prior_var
 
+        # Precompute transition-level node indices (query-agnostic)
+        self._all_transition_idxs = []
+        for idx, node in self._index_to_node.items():
+            depth = 0
+            cur = node
+            while getattr(cur, 'parent', None) is not None:
+                depth += 1
+                cur = cur.parent
+            if depth == self.transition_depth:
+                self._all_transition_idxs.append(idx)
+        self._num_transitions = len(self._all_transition_idxs)
+
         self._prediction_index_valid = True
         print(f"Prediction index built: {num_nodes} nodes indexed, {leaf_idx} leaf paths cached")
         if self._path_matrix is not None:
             print(f"Path matrix shape: {self._path_matrix.shape}, nnz: {self._path_matrix._nnz()}")
 
-    def cobweb_predict_indexed(self, input, k=5, return_ids=False, is_embedding=False):
+    def cobweb_predict(self, input, k=5, return_ids=False, is_embedding=False):
         """
-        Ultra-fast prediction using sparse matrix operations for path scoring.
+        Main two-stage prediction method using configured first_method and
+        second_method. This replaces older single-stage prediction helpers and
+        centralizes the logic to (1) rank transition nodes by first_method and
+        (2) rank leaves under each transition node by second_method.
         """
         # Ensure prediction index is built
-        self.build_prediction_index()
+        if not self._prediction_index_valid:
+            self.build_prediction_index()
         
         if is_embedding:
             emb = input
         else:
             emb = self.encode_func([input])[0]
 
+        # Only allow traversal-based first methods and dense second methods
+        if self.first_method not in ('bfs', 'dfs'):
+            raise ValueError("first_method must be 'bfs' or 'dfs'")
+        if self.second_method not in ('pathsum', 'dot'):
+            raise ValueError("second_method must be 'pathsum' or 'dot'")
+
         x = torch.tensor(emb, device=self.device)  # (D,)
-        
+
         num_leaves = len(self._leaf_to_path_indices)
         if num_leaves == 0:
             return []
-        
-        # Compute log probabilities for all nodes at once
-        # log_2pi = math.log(2 * math.pi)
+
+        # Compute node-level log probabilities (shared work)
         diff_sq = (x.unsqueeze(0) - self._node_means) ** 2  # (num_nodes, D)
-        
+
         node_log_probs = -0.5 * (
-            # log_2pi * self.tree.shape[0] +
             torch.log(self._node_vars).sum(dim=1) +
             (diff_sq / self._node_vars).sum(dim=1)
         )  # (num_nodes,)
-        
-        # Sum log probabilities along each leaf's path using sparse matrix multiplication
-        # self._path_matrix is [num_leaves, num_nodes], node_log_probs is [num_nodes]
+
+        # Precompute full-leaf scores (path-sum) if path matrix available
         if self._path_matrix is not None:
-            leaf_scores = torch.sparse.mm(self._path_matrix, node_log_probs.unsqueeze(1)).squeeze(1)  # (num_leaves,)
+            full_leaf_scores = torch.sparse.mm(self._path_matrix, node_log_probs.unsqueeze(1)).squeeze(1)
         else:
-            return []
-        
-        # Get top-k results
-        if k >= num_leaves:
-            # Add small random noise to break ties randomly
-            noise = torch.randn_like(leaf_scores) * 1e-6
-            noisy_scores = leaf_scores + noise
-            sorted_indices = torch.argsort(noisy_scores, descending=True)
-            selected_leaf_indices = sorted_indices.tolist()
-        else:
-            # Add small random noise to break ties randomly
-            noise = torch.randn_like(leaf_scores) * 1e-6
-            noisy_scores = leaf_scores + noise
-            _, topk_indices = torch.topk(noisy_scores, k, largest=True)
-            selected_leaf_indices = topk_indices.tolist()
-        
-        # Convert leaf indices to sentence IDs and results
+            full_leaf_scores = None
+
+        # Use cached mapping node_idx -> leaf rows (built at index time)
+        node_to_leaf_rows = getattr(self, '_node_to_leaf_rows', {})
+
+        # Use precomputed transition-level indices built at index time
+        all_transition_idxs = getattr(self, '_all_transition_idxs', [])
+        num_transitions = getattr(self, '_num_transitions', len(all_transition_idxs))
+
+        # Precompute full-leaf scores according to second_method (global ranking)
+        num_leaves = len(self._leaf_to_path_indices)
+        if self.second_method == 'pathsum':
+            if self._path_matrix is None:
+                raise ValueError('path_matrix is required for pathsum second_method')
+            full_leaf_scores = torch.sparse.mm(self._path_matrix, node_log_probs.unsqueeze(1)).squeeze(1)
+        else:  # 'dot'
+            scores = []
+            for r in range(num_leaves):
+                node_for_sent = self.sentence_to_node.get(r, None)
+                if node_for_sent is None:
+                    scores.append(float('-inf'))
+                else:
+                    cos = torch.nn.functional.cosine_similarity(
+                        x.unsqueeze(0), node_for_sent.mean.unsqueeze(0), dim=1
+                    ).item()
+                    scores.append(float(cos))
+            full_leaf_scores = torch.tensor(scores, device=self.device, dtype=torch.float)
+
+        # Get ordered transition nodes from the tree (first_method controls greedy)
+        retrieved_transitions = self.tree.categorize(
+            x, use_best=False, greedy=(self.first_method == 'dfs'),
+            max_nodes=self.max_init_search, retrieve_k=num_transitions,
+            transition_depth=self.transition_depth
+        )
+
+        ordered_transition_idxs = []
+        if retrieved_transitions:
+            for node in retrieved_transitions:
+                tidx = self._node_to_index.get(node, None)
+                if tidx is not None:
+                    ordered_transition_idxs.append(tidx)
+
+        # Append any missing transition nodes deterministically
+        for tidx in all_transition_idxs:
+            if tidx not in ordered_transition_idxs:
+                ordered_transition_idxs.append(tidx)
+
+        # Now collect top-k in parent-first order: for each transition node in
+        # order, take its leaves sorted by the global full_leaf_scores.
         results = []
-        for leaf_idx in selected_leaf_indices:
-            if leaf_idx < len(self.sentences):
-                results.append(leaf_idx if return_ids else self.sentences[leaf_idx])
-        
+        seen_leaf_rows = set()
+
+        for tidx in ordered_transition_idxs:
+            leaf_rows = node_to_leaf_rows.get(tidx, [])
+            if not leaf_rows:
+                continue
+            # sort leaf_rows by full_leaf_scores descending
+            leaf_scores = [(full_leaf_scores[r].item(), r) for r in leaf_rows]
+            leaf_scores.sort(key=lambda x: x[0], reverse=True)
+
+            for _, leaf_row in leaf_scores:
+                if leaf_row in seen_leaf_rows:
+                    continue
+                seen_leaf_rows.add(leaf_row)
+                if return_ids:
+                    results.append(leaf_row)
+                else:
+                    if 0 <= leaf_row < len(self.sentences):
+                        results.append(self.sentences[leaf_row])
+                if len(results) >= k:
+                    return results
+
         return results
-
-    def cobweb_rank_scores(self, input, is_embedding=False):
-        """
-        Differentiable: return raw scores for all leaves.
-        """
-        self.build_prediction_index()
-
-        if is_embedding:
-            x = input.to(self.device)  # already a torch tensor
-        else:
-            emb = self.encode_func([input])[0]
-            x = torch.tensor(emb, device=self.device)
-
-        if len(self._leaf_to_path_indices) == 0:
-            return torch.empty(0, device=self.device)
-
-        # Gaussian log-probs
-        diff_sq = (x.unsqueeze(0) - self._node_means) ** 2
-        node_log_probs = -0.5 * (
-            torch.log(self._node_vars).sum(dim=1)
-            + (diff_sq / self._node_vars).sum(dim=1)
-        )  # (num_nodes,)
-
-        # Aggregate along leaf paths
-        leaf_scores = torch.sparse.mm(
-            self._path_matrix, node_log_probs.unsqueeze(1)
-        ).squeeze(1)  # (num_leaves,)
-
-        return leaf_scores  # no top-k cut, differentiable
-
 
     def get_node_path_stats(self, sentence_id):
         """
@@ -424,42 +510,6 @@ class CobwebWrapper:
         self._invalidate_prediction_index()
         self.build_prediction_index()
 
-
-    def cobweb_predict_fast(self, input, k=5, return_ids=False, is_embedding=False):
-        """
-        Ultra-fast prediction using pre-built indices and cached statistics.
-        This is now an alias for the indexed prediction method.
-        """
-        return self.cobweb_predict_indexed(input, k, return_ids, is_embedding)
-
-    def cobweb_predict(self, input, k=5, return_ids=False, is_embedding=False):
-        """
-        Predict top-k similar entries from the tree.
-        
-        Args:
-            input (str or tensor): Sentence or embedding vector
-            k (int): Number of similar items to return
-            return_ids (bool): If True, return sentence IDs. Else, return sentences.
-            is_embedding (bool): Set True if `input` is already an embedding vector.
-        """
-        if is_embedding:
-            emb = input
-        else:
-            emb = self.encode_func([input])[0]
-
-        tensor = torch.tensor(emb, device=self.device)
-        leaves = self.tree.categorize(tensor, use_best=True, max_nodes=self.max_init_search, retrieve_k=k)
-
-        results = []
-        for leaf in leaves:
-            sid_lst = getattr(leaf, 'sentence_id', None)
-            random.shuffle(sid_lst)  # Shuffle to break ties randomly
-            for sid in sid_lst:
-                if sid is None or sid >= len(self.sentences):
-                    continue
-                results.append(sid if return_ids else self.sentences[sid])
-        return results
-
     def print_tree(self):
         """
         Recursively prints the tree structure.
@@ -480,79 +530,6 @@ class CobwebWrapper:
 
         print("\nCobweb Sentence Clustering Tree:")
         _print_node(self.tree.root)
-
-    def dump_json(self, save_path=None):
-        """
-        Serializes the CobwebWrapper into a JSON string.
-        Only serializes essential data: tree, sentences, and sentence-to-node mapping.
-        """
-        wrapper_state = {
-            "tree": json.loads(self.tree.dump_json()),
-            "sentences": self.sentences,
-            "embedding_dim": self.tree.shape[0] if hasattr(self.tree, 'shape') else None
-        }
-        if save_path:
-            with open(save_path, 'w') as f:
-                json.dump(wrapper_state, f, indent=2)
-        return json.dumps(wrapper_state, indent=2)
-
-
-    @staticmethod
-    def load_json(json_data, encode_func=lambda x: x):
-        """
-        Loads a CobwebWrapper from a JSON string or dict.
-
-        Args:
-            json_data (str or dict): The saved wrapper state.
-            encode_func (callable): The encoding function to be used.
-
-        Returns:
-            CobwebWrapper instance.
-        """
-        if isinstance(json_data, str):
-            data = json.loads(json_data)
-        else:
-            data = json_data
-
-        # Initialize wrapper with minimal setup
-        wrapper = CobwebWrapper.__new__(CobwebWrapper)
-        wrapper.device = data.get("device", "cuda" if torch.cuda.is_available() else "cpu")
-
-        # Load tree
-        sample_emb = encode_func(["test"])
-        embedding_shape = sample_emb.shape[1:]
-        tree = CobwebTorchTree(embedding_shape, wrapper.device) # TODO needs to be dumped with initial stuff!
-        print("Loading tree from JSON...")
-        tree.load_json(json.dumps(data["tree"]))
-        
-        wrapper.tree = tree
-        wrapper.encode_func = encode_func
-
-        # Restore attributes
-        wrapper.sentences = data.get("sentences", [])
-        wrapper.max_init_search = data.get("max_init_search", 100000)
-
-        # Initialize prediction index attributes
-        wrapper._prediction_index_valid = False
-        wrapper._node_to_index = {}
-        wrapper._index_to_node = {}
-        wrapper._node_means = None
-        wrapper._node_vars = None
-        wrapper._leaf_to_path_indices = {}
-
-        # Reconstruct sentence_to_node mapping
-        sentence_to_node = {}
-        def _index_nodes(node, st):
-            if hasattr(node, 'sentence_id') and node.sentence_id is not None:
-                sentence_to_node[node.sentence_id] = node
-            for child in getattr(node, "children", []):
-                _index_nodes(child, st)
-
-        _index_nodes(wrapper.tree.root, sentence_to_node)
-        wrapper.sentence_to_node = sentence_to_node
-        # wrapper.print_tree()
-
-        return wrapper
 
     def __len__(self):
         """
@@ -687,8 +664,6 @@ class CobwebWrapper:
         grandparents = collect_grandparents(tree_root)
         for gp in grandparents:
             process_subtree(gp)
-
-
 
     def visualize_subtrees(self, directory, num_leaves=6):
         self._visualize_grandparent_tree(self.tree.root, self.sentences, directory, num_leaves)
