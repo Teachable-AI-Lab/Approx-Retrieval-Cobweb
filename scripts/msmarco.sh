@@ -2,6 +2,8 @@
 #SBATCH --job-name=benchmark_ms_marco
 #SBATCH --time=24:00:00
 #SBATCH --mem=24G
+#SBATCH --gpus-per-node=a40
+#SBATCH --exclude=spot,heistotron
 #SBATCH --output=slurm_outputs/ms_marco.out
 #SBATCH --error=slurm_errors/ms_marco.err
 #SBATCH --partition="tail-lab"

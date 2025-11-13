@@ -8,5 +8,5 @@
     "compute": true,
     "first_method": "all",
     "second_method": "dot",
-    "transition_depth":  2
+    "transition_depth":  5
 }

@@ -285,13 +285,13 @@ class CobwebTorchTree(object):
                     child_score =  child_ll_inst #score + child_ll 
                     # child_score = child_ll + child_ll_inst # p(c|x) * p(x|c)
                     if greedy:
-                        add.append((-child_score, score, random(), c))
+                        add.append((-child_score, -score, random(), c))
                     else:
-                        heapq.heappush(queue, (-child_score, score, random(), c))
+                        heapq.heappush(queue, (-child_score, -score, random(), c))
 
                 if greedy:
                     add.sort()  # sort by neg_score
-                    queue.extend(add[::-1])
+                    queue.extend(add[::-1]) # reverses so that most optimal element is at the end
 
         if retrieve_k is None:
             return best if use_best else curr

@@ -240,7 +240,7 @@ class ApproxCobwebWrapper:
 
         # collecting transition_nodes
         self.transition_nodes = self.tree.categorize_transitions(
-            torch.ones(self.embedding_shape),
+            torch.ones(self.embedding_shape, device=self.device),
             transition_depth=self.transition_depth
         )
 
@@ -257,7 +257,6 @@ class ApproxCobwebWrapper:
             res = []
 
             while len(dq) > 0:
-
                 curr = dq.pop()
 
                 if hasattr(curr, "sentence_id") and len(curr.sentence_id) > 0:
@@ -375,7 +374,7 @@ class ApproxCobwebWrapper:
             else: # dot
                 scores = dotp_sliced(self.t_hash_to_leaf_idxs[hash(tnode)])
 
-            topk_idxs = torch.flip(np.argsort(scores)[-k:], dims=[0])
+            topk_idxs = torch.flip(np.argsort(scores.cpu())[-k:], dims=[0])
             retrieved.extend(
                 [self._index_to_node[self.t_hash_to_leaf_idxs[hash(tnode)][i]].sentence_id[0]
                     for i in topk_idxs][:min(k - len(retrieved), len(self.t_hash_to_leaf_idxs[hash(tnode)]))]
@@ -385,6 +384,34 @@ class ApproxCobwebWrapper:
             return retrieved
         else:
             return [self.sentences[i] for i in retrieved]
+        
+    def exact_cobweb_predict(self, input, k=5, return_ids=False, is_embedding=False):
+        """
+        Old Cobweb Prediction Function set manually to operate over DFS
+        (most similar to approximate retrieval).
+        """
+
+        # Ensure prediction index is built
+        if not self._prediction_index_valid:
+            self.build_prediction_index()
+        
+        if is_embedding:
+            emb = input
+        else:
+            emb = self.encode_func([input])[0]
+
+        x = torch.tensor(emb, device=self.device)  # (D,)
+
+        res = self.tree.categorize(
+            x,
+            greedy=True,
+            retrieve_k=k
+        )
+
+        if return_ids:
+            return res
+        else:
+            return [self.sentences[i.sentence_id[0]] for i in res]
 
     def get_node_path_stats(self, sentence_id):
         """
