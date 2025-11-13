@@ -14,10 +14,14 @@ The goal is to generalize Cobweb's exact retrieval methods in hybrid with existi
     *   Indexes will need to be built for each transition node in terms of only their respective leaves
 *   Once we've identified which combination of methods functions the best, we'll define a new implementation that spurs time complexity for optimal conditions
 
+*   Implementation for ```ApproxCobwebWrapper.py```:
+    *   
+
 # Implementation Strategy: Cobweb for PQ
 
 *   We'll create a class that does the following:
     *   Feeds all documents into Cobweb
+    *   For each document, 
 
 ## Benchmarks
 

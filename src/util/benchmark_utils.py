@@ -503,11 +503,6 @@ def load_pca_ica_model(corpus_embs: np.ndarray, model_name: str, dataset: str, s
 
 # === Retrieval Setup Functions ===
 
-def setup_cobweb_basic(corpus: List[str], corpus_embs: np.ndarray) -> ApproxCobwebWrapper:
-    """Setup a basic Cobweb wrapper."""
-    return ApproxCobwebWrapper(corpus=corpus, corpus_embeddings=corpus_embs, encode_func=lambda x: x)
-
-
 def setup_faiss(corpus_embs: np.ndarray, index_type: str = "dot"):
     """Setup a FAISS index for inner product similarity."""
     dim = corpus_embs.shape[1]
@@ -567,13 +562,9 @@ def setup_torch_dot(corpus_embs: np.ndarray) -> torch.Tensor:
 
 # === Retrieval Functions ===
 
-def retrieve_cobweb_basic(query_emb: np.ndarray, k: int, cobweb: ApproxCobwebWrapper, use_fast: bool = False) -> List[str]:
-    """Retrieve using Cobweb wrapper."""
-    if use_fast:
-        return cobweb.cobweb_predict_fast(query_emb, k)
-    else:
-        return cobweb.cobweb_predict(query_emb, k)
-
+def retrieve_cobweb_basic(query_emb: np.ndarray, k: int, cobweb: ApproxCobwebWrapper) -> List[str]:
+    """Retrieve using Cobweb wrapper (non-fast path). Only the standard prediction is supported."""
+    return cobweb.cobweb_predict(query_emb, k, is_embedding=True)
 
 def retrieve_faiss(query_emb: np.ndarray, k: int, index: faiss.IndexFlatIP, corpus: List[str]) -> List[str]:
     """Retrieve using FAISS index."""
@@ -793,25 +784,21 @@ def evaluate_retrieval(name: str, queries: List[np.ndarray], targets: List[str],
         # Original sequential processing (fallback for complete parallel failure)
         latencies = []
         for query, target in tqdm(zip(queries, targets), total=len(queries), desc=f"Evaluating {name} (sequential)"):
-            try:
-                start = time.time()
-                retrieved = retrieve_fn(query, top_k)
-                latencies.append(time.time() - start)
+            start = time.time()
+            retrieved = retrieve_fn(query, top_k)
+            latencies.append(time.time() - start)
 
-                for k in ks:
-                    top_k_results = retrieved[:k]
-                    if target in top_k_results:
-                        metrics[f"recall@{k}"] += 1
-                        rank = top_k_results.index(target) + 1
-                        metrics[f"mrr@{k}"] += 1 / rank
-                    relevance = [1 if doc == target else 0 for doc in top_k_results]
-                    if sum(relevance) > 0:
-                        ideal = sorted(relevance, reverse=True)
-                        ndcg = ndcg_score([ideal], [relevance])
-                        metrics[f"ndcg@{k}"] += ndcg
-            except Exception as e:
-                print(f"Query failed in sequential mode: {e}")
-                latencies.append(0.0)
+            for k in ks:
+                top_k_results = retrieved[:k]
+                if target in top_k_results:
+                    metrics[f"recall@{k}"] += 1
+                    rank = top_k_results.index(target) + 1
+                    metrics[f"mrr@{k}"] += 1 / rank
+                relevance = [1 if doc == target else 0 for doc in top_k_results]
+                if sum(relevance) > 0:
+                    ideal = sorted(relevance, reverse=True)
+                    ndcg = ndcg_score([ideal], [relevance])
+                    metrics[f"ndcg@{k}"] += ndcg
 
     # Normalize metrics by number of queries
     n = len(queries)

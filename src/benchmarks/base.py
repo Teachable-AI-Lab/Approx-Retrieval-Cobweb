@@ -42,16 +42,16 @@ class BaseBenchmark(ABC):
     def get_benchmark_list(self, method: str = "all") -> List[str]:
         """Get list of benchmark methods to run."""
         if method == "all":
-            return ['FAISS', 'FAISS IVF-PQ', 'Annoy', 'HNSWLib', 'Torch Dot', 'FAISS PCA + ICA', 'Torch PCA + ICA', 'Cobweb Basic', 'Cobweb PCA + ICA']
+            return ['FAISS', 'FAISS IVF-PQ', 'Annoy', 'HNSWLib', 'Torch Dot', 'FAISS PCA + ICA', 'Torch PCA + ICA', 'Cobweb PCA + ICA']
         elif method == "extra":
             return ['FAISS', 'FAISS IVF-PQ', 'Annoy', 'Torch Dot','FAISS PCA + ICA', 'Torch PCA + ICA', 'FAISS L2', 'FAISS L2 PCA + ICA', 
-                   'HNSWLib', 'HNSWLib PCA + ICA', 'Cobweb Basic', 'Cobweb PCA + ICA']
+                   'HNSWLib', 'HNSWLib PCA + ICA', 'Cobweb PCA + ICA']
         elif method == "cobweb":
-            return ['Cobweb Basic', 'Cobweb PCA + ICA']
-        elif method == "cobweb_pca":
             return ['Cobweb PCA + ICA']
+        elif method == "base":
+            return ["HNSWLib PCA + ICA", 'Cobweb PCA + ICA']
         elif method == "scale":
-            return ['FAISS', 'Cobweb PCA + ICA']
+            return ['FAISS IVF-PQ', 'HNSWLib PCA + ICA', 'Cobweb PCA + ICA']
         else:
             return []
     
@@ -217,34 +217,7 @@ class BaseBenchmark(ABC):
             print(f"--- HNSWLib PCA + ICA Metrics ---")
             print_metrics_table(results[-1], save_path=save_path)
             
-        # Cobweb benchmarks
-        if 'Cobweb Basic' in get_benchmarks:
-            print(f"Setting up Basic Cobweb (possibly multiple method combos)...")
-            first_method_arg = kwargs.get('first_method', 'bfs')
-            second_method_arg = kwargs.get('second_method', 'pathsum')
-            first_choices = ['bfs', 'dfs'] if first_method_arg == 'all' else [first_method_arg]
-            second_choices = ['pathsum', 'dot'] if second_method_arg == 'all' else [second_method_arg]
-
-            for fm in first_choices:
-                for sm in second_choices:
-                    print(f"Loading Cobweb (first={fm}, second={sm})")
-                    cobweb = load_cobweb_model(model_name, corpus, corpus_embs, split, "base", unique_id=unique_id, first_method=fm, second_method=sm, transition_depth=kwargs.get('transition_depth', 5), force_compute=kwargs.get('force_compute', True))
-                    name_tag = f"Cobweb Basic ({fm},{sm})"
-                    print(f"Evaluating {name_tag}")
-                    results.append(evaluate_retrieval(name_tag, queries_embs, targets,
-                                                    lambda q, k: retrieve_cobweb_basic(q, k, cobweb), top_k))
-                    print_metrics_table(results[-1], save_path=save_path)
-                    if include_cobweb_fast:
-                        print(f"--- Evaluating {name_tag} Fast ---")
-                        t = time.time()
-                        cobweb.build_prediction_index()
-                        print(f"--- Cobweb Constant Weighted Sum Index Built in {time.time() - t:.2f} seconds ---")
-                        results.append(evaluate_retrieval(f"{name_tag} Fast", queries_embs, targets,
-                                                        lambda q, k: retrieve_cobweb_basic(q, k, cobweb, True), top_k))
-                        print(f"--- Cobweb Constant Weighted Sum Metrics ---")
-                        print_metrics_table(results[-1], save_path=save_path)
-
-            
+        # Cobweb PCA + ICA benchmarks only (basic Cobweb and fast variants removed)
         if 'Cobweb PCA + ICA' in get_benchmarks:
             print(f"Setting up PCA + ICA Cobweb (possibly multiple method combos)...")
             first_method_arg = kwargs.get('first_method', 'bfs')
@@ -257,16 +230,6 @@ class BaseBenchmark(ABC):
                     print(f"Loading Cobweb PCA+ICA (first={fm}, second={sm})")
                     cobweb_pca_ica = load_cobweb_model(model_name, corpus, pca_ica_corpus_embs, split, "pca_ica", unique_id=unique_id, first_method=fm, second_method=sm, transition_depth=kwargs.get('transition_depth', 5), force_compute=kwargs.get('force_compute', True))
                     name_tag = f"Cobweb PCA+ICA ({fm},{sm})"
-                    if include_cobweb_fast:
-                        print(f"--- Evaluating {name_tag} Fast ---")
-                        t = time.time()
-                        cobweb_pca_ica.build_prediction_index()
-                        print(f"--- Cobweb PCA + ICA Constant Weighted Sum Index Built in {time.time() - t:.2f} seconds ---")
-                        results.append(evaluate_retrieval(f"{name_tag} Fast", pca_ica_queries_embs, targets,
-                                                        lambda q, k: retrieve_cobweb_basic(q, k, cobweb_pca_ica, True), top_k))
-                        print(f"--- Cobweb PCA + ICA Constant Weighted Sum Metrics ---")
-                        print_metrics_table(results[-1], save_path=save_path)
-
                     print(f"Evaluating {name_tag}")
                     results.append(evaluate_retrieval(name_tag, pca_ica_queries_embs, targets,
                                                     lambda q, k: retrieve_cobweb_basic(q, k, cobweb_pca_ica), top_k))
@@ -338,7 +301,7 @@ class BaseBenchmark(ABC):
         include_cobweb_fast = kwargs.get('include_cobweb_fast', True)
         results = self.run_benchmark_methods(
             embeddings, pca_ica_data, model_name, split, unique_id, 
-            top_k, method, include_cobweb_fast
+            top_k, method, include_cobweb_fast, **kwargs
         )
         
         return results

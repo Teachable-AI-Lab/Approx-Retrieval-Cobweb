@@ -4,13 +4,14 @@ import random
 import math
 from tqdm import tqdm
 from collections import deque
+import numpy as np
 import os
 import hashlib
 from graphviz import Digraph
 from src.cobweb.CobwebTorchTree import CobwebTorchTree
 
 class ApproxCobwebWrapper:
-    def __init__(self, first_method:str, second_method:str, transition_depth:int=5, corpus=None, corpus_embeddings=None, encode_func=lambda x: x):
+    def __init__(self, first_method:str, second_method:str, transition_depth:int=1, corpus=None, corpus_embeddings=None, encode_func=lambda x: x):
         """
         Initializes the ApproxCobwebWrapper with optional sentences and/or embeddings.
 
@@ -52,6 +53,7 @@ class ApproxCobwebWrapper:
         # Prediction index caching
         self._prediction_index_valid = False
         self._index_to_node = {}
+        self._node_to_index = {}
         self._node_means = None
         self._node_vars = None
         self._leaf_to_path_indices = None
@@ -60,13 +62,13 @@ class ApproxCobwebWrapper:
         # Determine embedding shape
         if corpus_embeddings is not None:
             corpus_embeddings = torch.tensor(corpus_embeddings) if isinstance(corpus_embeddings, list) else corpus_embeddings
-            embedding_shape = corpus_embeddings.shape[1:]
+            self.embedding_shape = corpus_embeddings.shape[1:]
         elif corpus and len(corpus) > 0:
             sample_emb = self.encode_func([corpus[0]])
-            embedding_shape = sample_emb.shape[1:]
+            self.embedding_shape = sample_emb.shape[1:]
 
 
-        self.tree = CobwebTorchTree(shape=embedding_shape, device=self.device)
+        self.tree = CobwebTorchTree(shape=self.embedding_shape, device=self.device)
 
         if corpus_embeddings is not None:
             if corpus is None:
@@ -109,20 +111,12 @@ class ApproxCobwebWrapper:
     def _invalidate_prediction_index(self):
         """Invalidate the prediction index when tree structure changes"""
         self._prediction_index_valid = False
-        # Clear mappings and cached tensors
-        try:
-            self._index_to_node.clear()
-        except Exception:
-            self._index_to_node = {}
+        self._index_to_node.clear()
+        self._node_to_index.clear()
         self._node_means = None
         self._node_vars = None
         self._leaf_to_path_indices = None
         self._path_matrix = None
-        # Clear additional cached query-agnostic structures
-        self._node_to_leaf_rows = {}
-        self._node_to_index = {}
-        self._all_transition_idxs = []
-        self._num_transitions = 0
 
     def build_prediction_index(self):
         """
@@ -138,6 +132,7 @@ class ApproxCobwebWrapper:
         
         # Clear existing mappings
         self._index_to_node.clear()
+        self._node_to_index.clear()
         new_sentences = [None] * len(self.sentences)
 
         # Collect all nodes via BFS traversal
@@ -150,6 +145,7 @@ class ApproxCobwebWrapper:
             node, path = queue[0]
             queue = queue[1:]
             self._index_to_node[idx] = node
+            self._node_to_index[hash(node)] = idx
             for child in getattr(node, 'children', []):
                 queue.append((child, path + (idx,)))
             if hasattr(node, 'sentence_id') and node.sentence_id:
@@ -218,26 +214,12 @@ class ApproxCobwebWrapper:
         else:
             self._path_matrix = None
 
-        # Build mapping: node_idx -> list of leaf row indices for fast lookup
-        # (query-agnostic, cached here)
-        self._node_to_leaf_rows = {}
-        for leaf_idx, path in enumerate(self._leaf_to_path_indices):
-            if path is None:
-                continue
-            for node_idx in path:
-                self._node_to_leaf_rows.setdefault(node_idx, []).append(leaf_idx)
-
         # Pre-allocate tensors for means and variances
         num_nodes = idx
         self._node_means = torch.zeros(num_nodes, self.tree.shape[0], 
                                      device=self.device, dtype=torch.float)
         self._node_vars = torch.zeros(num_nodes, self.tree.shape[0], 
                                     device=self.device, dtype=torch.float)
-
-
-
-        # Build reverse mapping node -> index for quick lookup
-        self._node_to_index = {n: i for i, n in self._index_to_node.items()}
 
         # Fill tensors with node statistics
         for idx, node in self._index_to_node.items():
@@ -249,22 +231,49 @@ class ApproxCobwebWrapper:
                 # Use prior variance for empty nodes
                 self._node_vars[idx] = self.tree.prior_var
 
-        # Precompute transition-level node indices (query-agnostic)
-        self._all_transition_idxs = []
-        for idx, node in self._index_to_node.items():
-            depth = 0
-            cur = node
-            while getattr(cur, 'parent', None) is not None:
-                depth += 1
-                cur = cur.parent
-            if depth == self.transition_depth:
-                self._all_transition_idxs.append(idx)
-        self._num_transitions = len(self._all_transition_idxs)
-
         self._prediction_index_valid = True
         print(f"Prediction index built: {num_nodes} nodes indexed, {leaf_idx} leaf paths cached")
         if self._path_matrix is not None:
             print(f"Path matrix shape: {self._path_matrix.shape}, nnz: {self._path_matrix._nnz()}")
+
+        print("Building Transition-Node-To-Leaf Datastructure")
+
+        # collecting transition_nodes
+        self.transition_nodes = self.tree.categorize_transitions(
+            torch.ones(self.embedding_shape),
+            transition_depth=self.transition_depth
+        )
+
+        print("Number of transition nodes:", len(self.transition_nodes))
+
+        self.t_hash_to_leaf_idxs = {}
+        # finding all idxs for leaf
+
+        def get_leaf_idxs(node):
+            """Helper method to get leaf idxs."""
+
+            dq = [node]
+
+            res = []
+
+            while len(dq) > 0:
+
+                curr = dq.pop()
+
+                if hasattr(curr, "sentence_id") and len(curr.sentence_id) > 0:
+                    res.append(self._node_to_index[hash(curr)])
+
+                for child in curr.children:
+                    dq.append(child)
+            
+            return res
+
+        for tnode in self.transition_nodes:
+            self.t_hash_to_leaf_idxs[hash(tnode)] = get_leaf_idxs(tnode)
+
+        print("Number of leaves per transition node: ")
+        for tnode in self.transition_nodes:
+            print(hash(tnode), ":", len(self.t_hash_to_leaf_idxs[hash(tnode)]))
 
     def cobweb_predict(self, input, k=5, return_ids=False, is_embedding=False):
         """
@@ -290,95 +299,92 @@ class ApproxCobwebWrapper:
 
         x = torch.tensor(emb, device=self.device)  # (D,)
 
-        num_leaves = len(self._leaf_to_path_indices)
-        if num_leaves == 0:
-            return []
+        if len(self._leaf_to_path_indices) == 0:
+            return torch.empty(0, device=self.device)
+        
+        def pathsum_sliced(idxs: list):
+            """
+            Compute leaf path scores for a subset of indices.
+            idxs: list of node indices to include.
+            """
 
-        # Compute node-level log probabilities (shared work)
-        diff_sq = (x.unsqueeze(0) - self._node_means) ** 2  # (num_nodes, D)
+            # Slice relevant tensors
+            node_means = self._node_means[idxs]           # (num_selected_nodes, dim)
+            node_vars = self._node_vars[idxs]             # (num_selected_nodes, dim)
+            coo = self._path_matrix.coalesce()
+            rows, cols = coo.indices()
+            vals = coo.values()
 
-        node_log_probs = -0.5 * (
-            torch.log(self._node_vars).sum(dim=1) +
-            (diff_sq / self._node_vars).sum(dim=1)
-        )  # (num_nodes,)
+            idxs_tensor = torch.tensor(idxs, device=cols.device, dtype=cols.dtype)
 
-        # Precompute full-leaf scores (path-sum) if path matrix available
-        if self._path_matrix is not None:
-            full_leaf_scores = torch.sparse.mm(self._path_matrix, node_log_probs.unsqueeze(1)).squeeze(1)
-        else:
-            full_leaf_scores = None
+            # Only keep entries whose column index is in idxs
+            mask = torch.isin(cols, idxs_tensor)
+            rows = rows[mask]
+            cols = cols[mask]
+            vals = vals[mask]
 
-        # Use cached mapping node_idx -> leaf rows (built at index time)
-        node_to_leaf_rows = getattr(self, '_node_to_leaf_rows', {})
+            # Rebuild the sparse tensor
+            path_matrix = torch.sparse_coo_tensor(
+                torch.stack([rows, cols]),
+                vals,
+                size=(self._path_matrix.size(0), len(idxs))
+            )
 
-        # Use precomputed transition-level indices built at index time
-        all_transition_idxs = getattr(self, '_all_transition_idxs', [])
-        num_transitions = getattr(self, '_num_transitions', len(all_transition_idxs))
+            # Gaussian log-probs (for selected nodes)
+            diff_sq = (x.unsqueeze(0) - node_means) ** 2
+            node_log_probs = -0.5 * (
+                torch.log(node_vars).sum(dim=1)
+                + (diff_sq / node_vars).sum(dim=1)
+            )  # (num_selected_nodes,)
 
-        # Precompute full-leaf scores according to second_method (global ranking)
-        num_leaves = len(self._leaf_to_path_indices)
-        if self.second_method == 'pathsum':
-            if self._path_matrix is None:
-                raise ValueError('path_matrix is required for pathsum second_method')
-            full_leaf_scores = torch.sparse.mm(self._path_matrix, node_log_probs.unsqueeze(1)).squeeze(1)
-        else:  # 'dot'
-            scores = []
-            for r in range(num_leaves):
-                node_for_sent = self.sentence_to_node.get(r, None)
-                if node_for_sent is None:
-                    scores.append(float('-inf'))
-                else:
-                    cos = torch.nn.functional.cosine_similarity(
-                        x.unsqueeze(0), node_for_sent.mean.unsqueeze(0), dim=1
-                    ).item()
-                    scores.append(float(cos))
-            full_leaf_scores = torch.tensor(scores, device=self.device, dtype=torch.float)
+            # Aggregate along leaf paths
+            leaf_scores = torch.sparse.mm(
+                path_matrix, node_log_probs.unsqueeze(1)
+            ).squeeze(1)  # (num_leaves,)
 
-        # Get ordered transition nodes from the tree (first_method controls greedy)
-        retrieved_transitions = self.tree.categorize(
-            x, use_best=False, greedy=(self.first_method == 'dfs'),
-            max_nodes=self.max_init_search, retrieve_k=num_transitions,
-            transition_depth=self.transition_depth
+            return leaf_scores
+        
+        def dotp_sliced(idxs: list):
+            # Slice node means for selected indices
+            node_means = self._node_means[idxs]  # (num_selected_nodes, dim)
+            # Handle batch or single input
+            if x.ndim == 1:
+                # Single vector input
+                scores = torch.matmul(node_means, x)  # (num_selected_nodes,)
+            else:
+                # Batched input
+                scores = torch.matmul(x, node_means.T)  # (batch, num_selected_nodes)
+
+            return scores
+
+        ranked_tnodes = self.tree.categorize_transitions(
+            x,
+            transition_depth=self.transition_depth,
+            greedy=(self.first_method == 'dfs')
         )
 
-        ordered_transition_idxs = []
-        if retrieved_transitions:
-            for node in retrieved_transitions:
-                tidx = self._node_to_index.get(node, None)
-                if tidx is not None:
-                    ordered_transition_idxs.append(tidx)
+        retrieved = []
 
-        # Append any missing transition nodes deterministically
-        for tidx in all_transition_idxs:
-            if tidx not in ordered_transition_idxs:
-                ordered_transition_idxs.append(tidx)
+        for tnode in ranked_tnodes:
 
-        # Now collect top-k in parent-first order: for each transition node in
-        # order, take its leaves sorted by the global full_leaf_scores.
-        results = []
-        seen_leaf_rows = set()
+            if len(retrieved) == k:
+                break
 
-        for tidx in ordered_transition_idxs:
-            leaf_rows = node_to_leaf_rows.get(tidx, [])
-            if not leaf_rows:
-                continue
-            # sort leaf_rows by full_leaf_scores descending
-            leaf_scores = [(full_leaf_scores[r].item(), r) for r in leaf_rows]
-            leaf_scores.sort(key=lambda x: x[0], reverse=True)
+            if self.second_method == "pathsum":
+                scores = pathsum_sliced(self.t_hash_to_leaf_idxs[hash(tnode)])
+            else: # dot
+                scores = dotp_sliced(self.t_hash_to_leaf_idxs[hash(tnode)])
 
-            for _, leaf_row in leaf_scores:
-                if leaf_row in seen_leaf_rows:
-                    continue
-                seen_leaf_rows.add(leaf_row)
-                if return_ids:
-                    results.append(leaf_row)
-                else:
-                    if 0 <= leaf_row < len(self.sentences):
-                        results.append(self.sentences[leaf_row])
-                if len(results) >= k:
-                    return results
+            topk_idxs = torch.flip(np.argsort(scores)[-k:], dims=[0])
+            retrieved.extend(
+                [self._index_to_node[self.t_hash_to_leaf_idxs[hash(tnode)][i]].sentence_id[0]
+                    for i in topk_idxs][:min(k - len(retrieved), len(self.t_hash_to_leaf_idxs[hash(tnode)]))]
+            )
 
-        return results
+        if return_ids:
+            return retrieved
+        else:
+            return [self.sentences[i] for i in retrieved]
 
     def get_node_path_stats(self, sentence_id):
         """
