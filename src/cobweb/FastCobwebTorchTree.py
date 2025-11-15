@@ -20,7 +20,7 @@ class FastCobwebTorchTree(object):
     """
 
     def __init__(self, shape, use_info=True, acuity_cutoff=False,
-                 use_kl=True, prior_var=None, alpha=1e-8, device=None, gradient_flow=False, precompute=10000):
+                 use_kl=True, prior_var=None, alpha=1e-8, device=None, gradient_flow=False, precompute=30000):
         """
         The tree constructor.
         """
@@ -251,6 +251,8 @@ class FastCobwebTorchTree(object):
 
             self._leaf_idxs[self.hash_to_idx[hash(current)]] = 1
 
+            return current
+
         elif not current.children:
             # fringe split
             # before: parent -> current
@@ -310,6 +312,8 @@ class FastCobwebTorchTree(object):
 
             self._leaf_idxs[newChildIdx] = 1
 
+            return newChild
+
         else:
             newChild = current.create_new_child(instance)
 
@@ -333,7 +337,7 @@ class FastCobwebTorchTree(object):
             self._leaf_idxs[self.hash_to_idx[hash(newChild)]] = 1
             self._leaf_idxs[self.hash_to_idx[hash(current)]] = 0
 
-        return current
+            return newChild
     
     def fast_categorize(self, instance, leaf=False, k=1):
         """
@@ -350,9 +354,25 @@ class FastCobwebTorchTree(object):
             return self.root
 
         if leaf:
-            scores = scores * self._leaf_idxs
+            scores = scores * self._leaf_idxs[:len(self.idx_to_node)]
 
-        _, indices = torch.topk(scores, k)
+        def get_topk_nonzero_indices(tensor_1d, k):
+            nonzero_indices = torch.nonzero(tensor_1d, as_tuple=False).squeeze()
+            if nonzero_indices.dim() == 0:
+                nonzero_indices = nonzero_indices.unsqueeze(0)
+            
+            num_nonzero = nonzero_indices.numel()
+            k = min(k, num_nonzero)
+            
+            nonzero_values = tensor_1d[nonzero_indices]
+
+            _, indices_of_topk = torch.topk(nonzero_values, k, largest=True, sorted=True)
+            
+            topk_nonzero_indices = nonzero_indices[indices_of_topk]
+            
+            return topk_nonzero_indices
+        
+        indices = get_topk_nonzero_indices(scores, k)
 
         if k == 1:
             return self.idx_to_node[indices[0]]
@@ -604,8 +624,6 @@ class FastCobwebTorchTree(object):
 
         if retrieve_k is None:
             return best if use_best else curr
-        
-        print(retrieved)
 
         return [retrieved[i][-1] for i in range(retrieve_k)]
 

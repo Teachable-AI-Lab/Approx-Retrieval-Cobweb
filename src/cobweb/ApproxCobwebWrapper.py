@@ -392,8 +392,6 @@ class ApproxCobwebWrapper:
         (most similar to approximate retrieval).
         """
 
-        self.tree.analyze_structure()
-
         # Ensure prediction index is built
         if not self._prediction_index_valid:
             self.build_prediction_index()
@@ -405,14 +403,20 @@ class ApproxCobwebWrapper:
 
         x = torch.tensor(emb, device=self.device)  # (D,)
 
-        res = self.tree.categorize(
+        res = self.tree.fast_categorize(
             x,
-            greedy=False,
-            retrieve_k=k
+            leaf=True,
+            k=k
         )
 
+        # res = self.tree.categorize(
+        #     x,
+        #     greedy=False,
+        #     retrieve_k=k
+        # )
+
         if return_ids:
-            return res
+            return [i.sentence_id[0] for i in res]
         else:
             return [self.sentences[i.sentence_id[0]] for i in res]
 

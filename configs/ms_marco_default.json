@@ -1,10 +1,10 @@
 {
     "model_name": "all-roberta-large-v1",
     "method": "base",
-    "subset_size": 1000,
+    "subset_size": 10000,
     "split": "validation",
-    "target_size": 100,
-    "top_k": 10,
+    "target_size": 1000,
+    "top_k": 20,
     "compute": true,
     "first_method": "bfs",
     "second_method": "dot",
