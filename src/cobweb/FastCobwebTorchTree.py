@@ -20,7 +20,7 @@ class FastCobwebTorchTree(object):
     """
 
     def __init__(self, shape, use_info=True, acuity_cutoff=False,
-                 use_kl=True, prior_var=None, alpha=1e-8, device=None, gradient_flow=False, precompute=30000):
+                 use_kl=True, prior_var=None, alpha=1e-8, device=None, gradient_flow=False, precompute=10000):
         """
         The tree constructor.
         """
@@ -222,6 +222,11 @@ class FastCobwebTorchTree(object):
             parentUp = current
             while parentUp:
                 parentUp.increment_counts(instance)
+
+                # need to update mean-vars here!
+                self._node_means[self.hash_to_idx[hash(parentUp)]] = parentUp.mean
+                self._node_vars[self.hash_to_idx[hash(parentUp)]] = parentUp.var
+
                 if hasattr(parentUp, "parent") and parentUp.parent:
                     parentUp = parentUp.parent
                 else:
@@ -229,12 +234,12 @@ class FastCobwebTorchTree(object):
 
         if not current.children and (current.is_exact_match(instance) or
                                          current.count == 0):
+            
+            self.hash_to_idx[hash(current)] = len(self.idx_to_node)
+
             increment_up(current)
 
             # update pathsum datastructures
-            self.hash_to_idx[hash(current)] = len(self.idx_to_node)
-            self._node_means[len(self.idx_to_node)] = current.mean
-            self._node_vars[len(self.idx_to_node)] = current.var
             idx = len(self.idx_to_node)
             if current.parent:
                 self._node_to_path_indices[idx] = self._node_to_path_indices[self.hash_to_idx[hash(current.parent)]] + [idx]
@@ -269,8 +274,6 @@ class FastCobwebTorchTree(object):
             
             newChild = new.create_new_child(instance)
 
-            increment_up(newChild)
-
             # update pathsum datastructures (for both newChild and new)
 
             # steps for integrating our stuff (in order):
@@ -285,14 +288,11 @@ class FastCobwebTorchTree(object):
             self.hash_to_idx[hash(newChild)] = len(self.idx_to_node)
             self.idx_to_node.append(newChild)
 
+            increment_up(newChild)
+
             newIdx = self.hash_to_idx[hash(new)]
             currIdx = self.hash_to_idx[hash(current)]
             newChildIdx = self.hash_to_idx[hash(newChild)]
-
-            self._node_means[newIdx] = new.mean
-            self._node_vars[newIdx] = new.var
-            self._node_means[newChildIdx] = newChild.mean
-            self._node_vars[newChildIdx] = newChild.var
 
             # specific changes for node 'new'
             self._node_to_path_indices[newIdx] = self._node_to_path_indices[currIdx] + [newIdx]
@@ -317,12 +317,11 @@ class FastCobwebTorchTree(object):
         else:
             newChild = current.create_new_child(instance)
 
+            self.hash_to_idx[hash(newChild)] = len(self.idx_to_node)
+
             increment_up(newChild)
 
             # update pathsum datastructures
-            self.hash_to_idx[hash(newChild)] = len(self.idx_to_node)
-            self._node_means[len(self.idx_to_node)] = newChild.mean
-            self._node_vars[len(self.idx_to_node)] = newChild.var
             idx = len(self.idx_to_node)
             self._node_to_path_indices[idx] = self._node_to_path_indices[self.hash_to_idx[hash(newChild.parent)]] + [idx]
             row = torch.zeros(self._path_matrix.size(1), dtype=self._path_matrix.dtype, device=self.device)

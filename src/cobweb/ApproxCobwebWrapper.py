@@ -237,6 +237,8 @@ class ApproxCobwebWrapper:
         if self._path_matrix is not None:
             print(f"Path matrix shape: {self._path_matrix.shape}, nnz: {self._path_matrix._nnz()}")
 
+        self.tree.analyze_structure()
+
         print("Building Transition-Node-To-Leaf Datastructure")
 
         # collecting transition_nodes
