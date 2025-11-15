@@ -559,12 +559,11 @@ def setup_torch_dot(corpus_embs: np.ndarray) -> torch.Tensor:
     """Setup torch tensor for direct dot product similarity computation."""
     return torch.from_numpy(corpus_embs).float()
 
-
 # === Retrieval Functions ===
 
 def retrieve_cobweb_basic(query_emb: np.ndarray, k: int, cobweb: ApproxCobwebWrapper) -> List[str]:
     """Retrieve using Cobweb wrapper (non-fast path). Only the standard prediction is supported."""
-    return cobweb.cobweb_predict(query_emb, k, is_embedding=True)
+    return cobweb.exact_cobweb_predict(query_emb, k, is_embedding=True)
 
 def retrieve_faiss(query_emb: np.ndarray, k: int, index: faiss.IndexFlatIP, corpus: List[str]) -> List[str]:
     """Retrieve using FAISS index."""

@@ -283,7 +283,7 @@ class CobwebTorchNode(object):
 
         return score / len(self.children)
 
-    def get_best_operation(self, instance, best1, best2, best1_pu):
+    def get_best_operation(self, instance, best1, best2, best1_pu, merge_split=True):
         """
         Given an instance, the two best children based on category utility and
         a set of possible operations, find the operation that produces the
@@ -360,11 +360,12 @@ class CobwebTorchNode(object):
 
         operations.append((best1_pu, random(), "best"))
         operations.append((self.pu_for_new_child(instance), random(), 'new'))
-        if len(self.children) > 2 and best2:
-            operations.append((self.pu_for_merge(best1, best2, instance),
-                               random(), 'merge'))
-        if len(best1.children) > 0:
-            operations.append((self.pu_for_split(best1), random(), 'split'))
+        if merge_split:
+            if len(self.children) > 2 and best2:
+                operations.append((self.pu_for_merge(best1, best2, instance),
+                                random(), 'merge'))
+            if len(best1.children) > 0:
+                operations.append((self.pu_for_split(best1), random(), 'split'))
 
         operations.sort(reverse=True)
         best_op = (operations[0][0], operations[0][2])

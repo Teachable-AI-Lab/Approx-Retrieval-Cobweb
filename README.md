@@ -29,12 +29,21 @@ Traditional Product-Quantization operates as follows:
     *   Create a vector with the centroid index of each of the K subspaces
 
 There are many different ways we can choose to implement PQ with Cobweb!
-*   One way is taking the path of a given vector as its new 
+*   One way is taking the path of a given vector as its new encoding - however similar vectors don't always have the same path so this might be chopped
 
 ## Speeding up Cobweb
 
 *   The core of the idea revolves around our pathsum calculation - we can just pathsum to figure out where the node goes, and then update the heuristics of the path of the node
-*   The most computationally expensive part of the fitting process for Cobweb is the decision-making at each node. So even though we may not recognize a time-complex advantage, we will definitely be able to find a computational advantage to updating in retrospect vs. calculating in real time
+*   The most computationally expensive part of the fitting process for Cobweb is the decision-making at each node. So even though we may not recognize a time-complex advantage, we will definitely be able to find a computational advantage to updating in retrospect vs. calculating in real time!
+*   Implementation plan:
+    *   Implement fitting in the way that categorize does fitting (need to verify that this works first)
+        *   We should implement the categorize function within ifit to find the necessary node and then traverse backwards
+        *   Store the nodes's parents for easy backwards traversal, update each node as you go up the path once identifying categorization through increment_counts() (only time we need to call "create_new_child" is at the node that we initialize our new node)
+        *   Need to verify that categorization will actually sort to intermediary nodes if we provide it with the option to do so
+        *   Additionally, we need to flesh out fringe split and other edge cases well so that 
+    *   Initialize all the structures needed for computation of Pathsum within the CobwebTree itself
+    *   Simply change the categorization logic to PathSum logic
+*   Note that we may even be able to bring back a whole-tree merge split pass-through as we traverse back up the tree
 
 ## Benchmarks
 

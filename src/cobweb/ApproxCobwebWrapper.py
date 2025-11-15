@@ -9,6 +9,7 @@ import os
 import hashlib
 from graphviz import Digraph
 from src.cobweb.CobwebTorchTree import CobwebTorchTree
+from src.cobweb.FastCobwebTorchTree import FastCobwebTorchTree
 
 class ApproxCobwebWrapper:
     def __init__(self, first_method:str, second_method:str, transition_depth:int=1, corpus=None, corpus_embeddings=None, encode_func=lambda x: x):
@@ -68,7 +69,7 @@ class ApproxCobwebWrapper:
             self.embedding_shape = sample_emb.shape[1:]
 
 
-        self.tree = CobwebTorchTree(shape=self.embedding_shape, device=self.device)
+        self.tree = FastCobwebTorchTree(shape=self.embedding_shape, device=self.device)
 
         if corpus_embeddings is not None:
             if corpus is None:
@@ -98,7 +99,7 @@ class ApproxCobwebWrapper:
                                    total=len(new_sentences),
                                    desc="Training CobwebTree"):
             self.sentences.append(sent)
-            leaf = self.tree.ifit(torch.tensor(emb, device=self.device))
+            leaf = self.tree.fast_ifit(torch.tensor(emb, device=self.device))
             if leaf.sentence_id is None:
                 leaf.sentence_id = []
             leaf.sentence_id.append(start_index + i)
@@ -391,6 +392,8 @@ class ApproxCobwebWrapper:
         (most similar to approximate retrieval).
         """
 
+        self.tree.analyze_structure()
+
         # Ensure prediction index is built
         if not self._prediction_index_valid:
             self.build_prediction_index()
@@ -404,7 +407,7 @@ class ApproxCobwebWrapper:
 
         res = self.tree.categorize(
             x,
-            greedy=True,
+            greedy=False,
             retrieve_k=k
         )
 

@@ -1,6 +1,6 @@
 ##-------------------------------------------------------------
-## CobwebTorchTree.py
-## Implementation of a CobwebTree from https://github.com/Teachable-AI-Lab/cobweb
+## FastCobwebTorchTree.py
+## Extension to CobwebTorchTree with Python.
 ##-------------------------------------------------------------
 
 import json
@@ -11,16 +11,16 @@ from collections import defaultdict
 import heapq
 
 import torch
-from src.cobweb.CobwebTorchNode import CobwebTorchNode
+from src.cobweb.CobwebTorchNode import CobwebTorchNode # Already has a pointer to the parent!
 
-class CobwebTorchTree(object):
+class FastCobwebTorchTree(object):
     """
     The CobwebTree contains the knowledge base of a particular instance of the
     cobweb algorithm and can be used to fit and categorize instances.
     """
 
     def __init__(self, shape, use_info=True, acuity_cutoff=False,
-                 use_kl=True, prior_var=None, alpha=1e-8, device=None, gradient_flow=False):
+                 use_kl=True, prior_var=None, alpha=1e-8, device=None, gradient_flow=False, precompute=10000):
         """
         The tree constructor.
         """
@@ -38,9 +38,9 @@ class CobwebTorchTree(object):
         self.prior_var = prior_var
         if prior_var is None:
             self.prior_var = 1 / (2 * math.e * self.pi_tensor)
-        self.clear()
+        self.clear(precompute)
 
-    def clear(self):
+    def clear(self, precompute):
         """
         Clears the concepts of the tree and resets the node map.
         """
@@ -48,7 +48,40 @@ class CobwebTorchTree(object):
         self.root.tree = self
         # Build node_map for id->node lookup
         self.node_map = {self.root.id: self.root}
+
+        # New variables! Taken directly from the initial CobwebWrapper in the event that categorization-fitting works
+        self.idx_to_node = []
+        self.hash_to_idx = {}
+        self._node_means = torch.zeros(precompute, self.shape[0], 
+                                     device=self.device, dtype=torch.float)
+        # Initialize unused vars to the prior variance to avoid log(0)/div0
+        prior_val = (self.prior_var.item() if isinstance(self.prior_var, torch.Tensor)
+                     else float(self.prior_var))
+        self._node_vars = torch.full((precompute, self.shape[0]), prior_val,
+                                     device=self.device, dtype=torch.float)
+        self._node_to_path_indices = {} # designed to speed up path matrix computations
+        self._path_matrix = torch.zeros(precompute, precompute, device=self.device, dtype=torch.float) # precompute this to be large
+        self._leaf_idxs = torch.zeros(precompute, device=self.device, dtype=torch.float)
+
+    def resize_structs(self, new_size):
+        """
+        Helper function to resize old structure size to new structure size!
+
+        Only _node_means, _node_vars, and _path_matrix which should be resized as they are not
+        adaptive.
+        """
+        def resize_tensor_2d(tensor, new_shape):
+            old_rows, old_cols = tensor.shape
+            new_rows, new_cols = new_shape
+            result = torch.zeros(new_rows, new_cols, dtype=tensor.dtype, device=tensor.device)
+            rows_to_copy = min(old_rows, new_rows)
+            cols_to_copy = min(old_cols, new_cols)
+            result[:rows_to_copy, :cols_to_copy] = tensor[:rows_to_copy, :cols_to_copy]
+            return result
         
+        self._node_means = resize_tensor_2d(self._node_means, (new_size, self.shape[0]))
+        self._node_vars = resize_tensor_2d(self._node_vars, (new_size, self.shape[0]))
+        self._path_matrix = resize_tensor_2d(self._path_matrix, (new_size, new_size))
 
     def _build_node_map(self):
         """
@@ -142,6 +175,226 @@ class CobwebTorchTree(object):
 
         with torch.no_grad():
             return self.cobweb(instance, merge_split)
+        
+    def fast_ifit(self, instance):
+        """
+        Fit instances repeatedly using a variant of the categorize function rather than
+        the traditional four actions. This will not produce an actual Cobweb Tree, but
+        merely a "Cobweb-estimate" that we may still be able to use for prediction.
+
+        Uses `_cobweb_categorize_best_node` for sorting. Note that this will eventually
+        be replaced by Pathsum.
+
+        Pipeline:
+        *   We use our new _cobweb_categorize_best_node to categorize the best node. Depending
+            on where this node is within the tree, we must employ a couple different choices.
+            *   If this node is a leaf node, we employ the fringe split case - create a common
+                parent to the current node and its parent and then have two descending children.
+                *   If this is repeatedly evaluated, we may end up with some form of degenerate
+                    tree, so hoping that isn't the case
+            *   Otherwise, we can build a child off the given node.
+        *   After we have a node, we recurse back up the tree doing the following until we hit
+            the root:
+            *   We go to the parent and increment counts
+        *   We update the pathsum calculation datastructures!
+
+        A little more on updating the pathsum calculation datastructures:
+        *   We need to save the node's mean and variance!
+        *   We need to update the node's 'global index' and be able to find any node given that
+            index (second part not yet confirmed)
+        *   Finally, we need to update the path-matrix with a new row and new column
+        *   There is no restructuring that takes place, so our two cases are the fringe-split case
+            and the regular case.
+            *   Fringe-Split: We need to create a new 
+        """
+
+        if len(self.idx_to_node) >= len(self._node_means):
+            self.resize_structs(len(self.idx_to_node) * 2 + 1)
+
+        current = self.fast_categorize(
+            instance,
+            leaf=False,
+            k=1
+        )
+
+        def increment_up(current):
+            # at the end of this method, need to traverse up from new and increment nodes
+            parentUp = current
+            while parentUp:
+                parentUp.increment_counts(instance)
+                if hasattr(parentUp, "parent") and parentUp.parent:
+                    parentUp = parentUp.parent
+                else:
+                    parentUp = None
+
+        if not current.children and (current.is_exact_match(instance) or
+                                         current.count == 0):
+            increment_up(current)
+
+            # update pathsum datastructures
+            self.hash_to_idx[hash(current)] = len(self.idx_to_node)
+            self._node_means[len(self.idx_to_node)] = current.mean
+            self._node_vars[len(self.idx_to_node)] = current.var
+            idx = len(self.idx_to_node)
+            if current.parent:
+                self._node_to_path_indices[idx] = self._node_to_path_indices[self.hash_to_idx[hash(current.parent)]] + [idx]
+            else:
+                self._node_to_path_indices[idx] = [idx]
+            # build a full row with ones at the path indices (match path_matrix dtype/device)
+            row = torch.zeros(self._path_matrix.size(1), dtype=self._path_matrix.dtype, device=self.device)
+            indices = self._node_to_path_indices[idx]
+            if len(indices) > 0:
+                inds = torch.tensor(indices, dtype=torch.long, device=self.device)
+                row[inds] = 1.0
+            self._path_matrix[idx] = row
+            self.idx_to_node.append(current)
+
+            self._leaf_idxs[self.hash_to_idx[hash(current)]] = 1
+
+        elif not current.children:
+            # fringe split
+            # before: parent -> current
+            # after: parent -> new -> current and new -> newChild
+            new = CobwebTorchNode(shape=self.shape, device=self.device, otherNode=current)
+            current.parent = new
+            new.children.append(current)
+
+            if new.parent:
+                new.parent.children.remove(current)
+                new.parent.children.append(new)
+            else:
+                self.root = new
+            
+            newChild = new.create_new_child(instance)
+
+            increment_up(newChild)
+
+            # update pathsum datastructures (for both newChild and new)
+
+            # steps for integrating our stuff (in order):
+            # for new - steal current's path and use it (swap current index true with new index true)
+            # for current - add new as an index
+            # for newChild - steal new's path and use it (just add newChild index true)
+
+            # add 'new' and 'newChild' as nodes
+            self.hash_to_idx[hash(new)] = len(self.idx_to_node)
+            self.idx_to_node.append(new)
+
+            self.hash_to_idx[hash(newChild)] = len(self.idx_to_node)
+            self.idx_to_node.append(newChild)
+
+            newIdx = self.hash_to_idx[hash(new)]
+            currIdx = self.hash_to_idx[hash(current)]
+            newChildIdx = self.hash_to_idx[hash(newChild)]
+
+            self._node_means[newIdx] = new.mean
+            self._node_vars[newIdx] = new.var
+            self._node_means[newChildIdx] = newChild.mean
+            self._node_vars[newChildIdx] = newChild.var
+
+            # specific changes for node 'new'
+            self._node_to_path_indices[newIdx] = self._node_to_path_indices[currIdx] + [newIdx]
+            self._node_to_path_indices[newIdx].remove(currIdx)
+            self._path_matrix[newIdx] = self._path_matrix[currIdx]
+            self._path_matrix[newIdx][currIdx] = 0
+            self._path_matrix[newIdx][newIdx] = 1
+
+            # specific changes for node 'current'
+            self._node_to_path_indices[currIdx].append(newIdx)
+            self._path_matrix[currIdx][newIdx] = 1
+
+            # specific changes for node 'child'
+            self._node_to_path_indices[newChildIdx] = self._node_to_path_indices[newIdx] + [newChildIdx]
+            self._path_matrix[newChildIdx] = self._path_matrix[newIdx]
+            self._path_matrix[newChildIdx][newChildIdx] = 1
+
+            self._leaf_idxs[newChildIdx] = 1
+
+        else:
+            newChild = current.create_new_child(instance)
+
+            increment_up(newChild)
+
+            # update pathsum datastructures
+            self.hash_to_idx[hash(newChild)] = len(self.idx_to_node)
+            self._node_means[len(self.idx_to_node)] = newChild.mean
+            self._node_vars[len(self.idx_to_node)] = newChild.var
+            idx = len(self.idx_to_node)
+            self._node_to_path_indices[idx] = self._node_to_path_indices[self.hash_to_idx[hash(newChild.parent)]] + [idx]
+            row = torch.zeros(self._path_matrix.size(1), dtype=self._path_matrix.dtype, device=self.device)
+            indices = self._node_to_path_indices[idx]
+            if len(indices) > 0:
+                inds = torch.tensor(indices, dtype=torch.long, device=self.device)
+                row[inds] = 1.0
+            self._path_matrix[idx] = row
+            self.idx_to_node.append(newChild)
+
+            # NEED TO STORE ALL LEAF IDXS
+            self._leaf_idxs[self.hash_to_idx[hash(newChild)]] = 1
+            self._leaf_idxs[self.hash_to_idx[hash(current)]] = 0
+
+        return current
+    
+    def fast_categorize(self, instance, leaf=False, k=1):
+        """
+        An adapted function that uses the CobwebWrapper Pathsum definitions to do prediction!
+
+        instance: the embedding to sort down!
+
+        Returns a single node for the node returned.
+        """
+        
+        scores = self.fast_categorize_scores(instance)
+
+        if scores == []:
+            return self.root
+
+        if leaf:
+            scores = scores * self._leaf_idxs
+
+        _, indices = torch.topk(scores, k)
+
+        if k == 1:
+            return self.idx_to_node[indices[0]]
+
+        return [self.idx_to_node[i] for i in indices]
+
+    def fast_categorize_scores(self, instance):
+        """
+        An adapted function that uses the CobwebWrapper Pathsum definitions to do prediction!
+
+        Returns a vector attributing to the scores of the categorization function.
+        """
+
+        if len(self.idx_to_node) == 0:
+            return []
+
+        x = instance.to(self.device)
+
+        if len(self._node_to_path_indices) == 0:
+            return torch.empty(0, device=self.device)
+
+        # Gaussian log-probs computed only over active nodes
+        num_nodes = len(self.idx_to_node)
+        if num_nodes == 0:
+            return torch.empty(0, device=self.device)
+
+        node_means = self._node_means[:num_nodes]
+        node_vars = self._node_vars[:num_nodes]
+        # avoid zeros/nans
+        eps = 1e-12
+        node_vars = node_vars.clamp(min=eps)
+
+        diff_sq = (x.unsqueeze(0) - node_means) ** 2
+        node_log_probs = -0.5 * (torch.log(node_vars).sum(dim=1) + (diff_sq / node_vars).sum(dim=1))
+        node_log_probs = node_log_probs.to(self._path_matrix.dtype)
+
+        # Multiply path matrix (rows x num_nodes) with node_log_probs
+        pm = self._path_matrix[:, :num_nodes]
+        node_scores = pm.matmul(node_log_probs.unsqueeze(1)).squeeze(1)
+
+        # return only the first num_nodes entries (consistent with usage)
+        return node_scores[:num_nodes]
 
     def cobweb(self, instance, merge_split):
         """
@@ -186,7 +439,7 @@ class CobwebTorchTree(object):
             # the current.count == 0 here is for the initially empty tree.
             if not current.children and (current.is_exact_match(instance) or
                                          current.count == 0):
-                # print("leaf match")
+                # print("root match or leaf match")
                 current.increment_counts(instance)
                 break
 
@@ -230,6 +483,63 @@ class CobwebTorchTree(object):
                                     '" not a recognized option. This should be'
                                     ' impossible...')
         return current
+
+    def _cobweb_categorize_best_node(self, instance, greedy=False, max_nodes=float('inf')):
+        """
+        A cobweb specific version of categorize, not intended to be
+        externally called.
+
+        TODO: We will eventually replace this with PathSum!
+
+        .. seealso:: :meth:`CobwebTree.categorize`
+        """
+        queue = []
+        heapq.heappush(queue, (-self.root.log_prob(instance), 0.0, random(), self.root))
+        nodes_visited = 0
+
+        best = self.root
+        best_score = float('-inf')
+
+        while len(queue) > 0:
+            if greedy:
+                neg_score, neg_curr_ll, _, curr = queue.pop()
+            else:
+                neg_score, neg_curr_ll, _, curr = heapq.heappop(queue)
+            score = -neg_score # the heap sorts smallest to largest, so we flip the sign
+            curr_ll = -neg_curr_ll # the heap sorts smallest to largest, so we flip the sign
+            nodes_visited += 1
+
+            if score > best_score:
+                best = curr
+                best_score = score
+
+            if nodes_visited >= max_nodes:
+                break
+
+            if len(curr.children) > 0:
+                ll_children_unnorm = torch.zeros(len(curr.children))
+                # for i, c in enumerate(curr.children):
+                #     log_prob = c.log_prob(instance)
+                #     ll_children_unnorm[i] = (log_prob + math.log(c.count) - math.log(curr.count))
+                # log_p_of_x = torch.logsumexp(ll_children_unnorm, dim=0)
+
+                add = []
+
+                for i, c in enumerate(curr.children):
+                    # child_ll = ll_children_unnorm[i] - log_p_of_x + curr_ll
+                    child_ll_inst = c.log_prob(instance)
+                    child_score =  child_ll_inst #score + child_ll 
+                    # child_score = child_ll + child_ll_inst # p(c|x) * p(x|c)
+                    if greedy:
+                        add.append((-child_score, -score, random(), c))
+                    else:
+                        heapq.heappush(queue, (-child_score, -score, random(), c))
+
+                if greedy:
+                    add.sort()  # sort by neg_score
+                    queue.extend(add[::-1]) # reverses so that most optimal element is at the end
+
+        return best
 
     def _cobweb_categorize(self, instance, use_best, greedy, max_nodes, retrieve_k=None):
         """
@@ -294,6 +604,9 @@ class CobwebTorchTree(object):
 
         if retrieve_k is None:
             return best if use_best else curr
+        
+        print(retrieved)
+
         return [retrieved[i][-1] for i in range(retrieve_k)]
 
     def categorize_transitions(self, instance, transition_depth, use_best=True, greedy=False, max_nodes=float('inf')):
