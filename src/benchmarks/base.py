@@ -47,7 +47,7 @@ class BaseBenchmark(ABC):
             return ['FAISS', 'FAISS IVF-PQ', 'Annoy', 'Torch Dot','FAISS PCA + ICA', 'Torch PCA + ICA', 'FAISS L2', 'FAISS L2 PCA + ICA', 
                    'HNSWLib', 'HNSWLib PCA + ICA', 'Cobweb PCA + ICA']
         elif method == "cobweb":
-            return ['Cobweb PCA + ICA']
+            return ['Cobweb Basic', 'Cobweb PCA + ICA']
         elif method == "base":
             return ["HNSWLib PCA + ICA", 'Cobweb PCA + ICA']
         elif method == "scale":
@@ -216,7 +216,27 @@ class BaseBenchmark(ABC):
                                             lambda q, k: retrieve_hnswlib(q, k, hnswlib_pca_ica_index, corpus), top_k))
             print(f"--- HNSWLib PCA + ICA Metrics ---")
             print_metrics_table(results[-1], save_path=save_path)
-            
+        
+
+        # Cobweb PCA + ICA benchmarks only (basic Cobweb and fast variants removed)
+        if 'Cobweb Basic' in get_benchmarks:
+            print(f"Setting up Basic Cobweb (possibly multiple method combos)...")
+            first_method_arg = kwargs.get('first_method', 'bfs')
+            second_method_arg = kwargs.get('second_method', 'pathsum')
+            first_choices = ['bfs', 'dfs'] if first_method_arg == 'all' else [first_method_arg]
+            second_choices = ['pathsum', 'dot'] if second_method_arg == 'all' else [second_method_arg]
+
+            for fm in first_choices:
+                for sm in second_choices:
+                    print(f"Loading Cobweb Basic (first={fm}, second={sm})")
+                    cobweb_basic = load_cobweb_model(model_name, corpus, corpus_embs, split, "basic", unique_id=unique_id, first_method=fm, second_method=sm, transition_depth=kwargs.get('transition_depth', 5), force_compute=kwargs.get('force_compute', True))
+                    name_tag = f"Cobweb Basic ({fm},{sm})"
+                    print(f"Evaluating {name_tag}")
+                    results.append(evaluate_retrieval(name_tag, queries_embs, targets,
+                                                    lambda q, k: retrieve_cobweb_basic(q, k, cobweb_basic), top_k))
+                    print(f"--- {name_tag} Metrics ---")
+                    print_metrics_table(results[-1], save_path=save_path)
+
         # Cobweb PCA + ICA benchmarks only (basic Cobweb and fast variants removed)
         if 'Cobweb PCA + ICA' in get_benchmarks:
             print(f"Setting up PCA + ICA Cobweb (possibly multiple method combos)...")

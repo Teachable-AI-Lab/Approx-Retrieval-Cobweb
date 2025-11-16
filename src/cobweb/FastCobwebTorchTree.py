@@ -20,7 +20,7 @@ class FastCobwebTorchTree(object):
     """
 
     def __init__(self, shape, use_info=True, acuity_cutoff=False,
-                 use_kl=True, prior_var=None, alpha=1e-8, device=None, gradient_flow=False, precompute=10000):
+                 use_kl=True, prior_var=None, alpha=1e-8, device=None, gradient_flow=False, precompute=40000):
         """
         The tree constructor.
         """
@@ -205,32 +205,30 @@ class FastCobwebTorchTree(object):
         *   Finally, we need to update the path-matrix with a new row and new column
         *   There is no restructuring that takes place, so our two cases are the fringe-split case
             and the regular case.
-            *   Fringe-Split: We need to create a new 
+            *   Fringe-Split: We need to create a new parent for the current node and its child
         """
 
         if len(self.idx_to_node) >= len(self._node_means):
             self.resize_structs(len(self.idx_to_node) * 2 + 1)
 
-        current = self.fast_categorize(
-            instance,
-            leaf=False,
-            k=1
-        )
-
-        def increment_up(current):
-            # at the end of this method, need to traverse up from new and increment nodes
-            parentUp = current
+        def increment_up(current_node):
+            # traverse up from the node and increment counts
+            parentUp = current_node
             while parentUp:
                 parentUp.increment_counts(instance)
 
-                # need to update mean-vars here!
-                self._node_means[self.hash_to_idx[hash(parentUp)]] = parentUp.mean
-                self._node_vars[self.hash_to_idx[hash(parentUp)]] = parentUp.var
+                # update mean/vars in preallocated buffers
+                if hash(parentUp) in self.hash_to_idx:
+                    idx_up = self.hash_to_idx[hash(parentUp)]
+                    self._node_means[idx_up] = parentUp.mean
+                    self._node_vars[idx_up] = parentUp.var
 
                 if hasattr(parentUp, "parent") and parentUp.parent:
                     parentUp = parentUp.parent
                 else:
                     parentUp = None
+
+        current = self.soft_find_first_new_greedy(instance)
 
         if not current.children and (current.is_exact_match(instance) or
                                          current.count == 0):
@@ -250,7 +248,7 @@ class FastCobwebTorchTree(object):
             indices = self._node_to_path_indices[idx]
             if len(indices) > 0:
                 inds = torch.tensor(indices, dtype=torch.long, device=self.device)
-                row[inds] = 1.0
+                row[inds] = 1.0 / float(len(indices))
             self._path_matrix[idx] = row
             self.idx_to_node.append(current)
 
@@ -297,18 +295,28 @@ class FastCobwebTorchTree(object):
             # specific changes for node 'new'
             self._node_to_path_indices[newIdx] = self._node_to_path_indices[currIdx] + [newIdx]
             self._node_to_path_indices[newIdx].remove(currIdx)
-            self._path_matrix[newIdx] = self._path_matrix[currIdx]
-            self._path_matrix[newIdx][currIdx] = 0
-            self._path_matrix[newIdx][newIdx] = 1
+            # rebuild normalized row for newIdx
+            new_inds = self._node_to_path_indices[newIdx]
+            new_row = torch.zeros(self._path_matrix.size(1), dtype=self._path_matrix.dtype, device=self.device)
+            if len(new_inds) > 0:
+                new_row[torch.tensor(new_inds, dtype=torch.long, device=self.device)] = 1.0 / float(len(new_inds))
+            self._path_matrix[newIdx] = new_row
 
-            # specific changes for node 'current'
+            # specific changes for node 'current' (append newIdx)
             self._node_to_path_indices[currIdx].append(newIdx)
-            self._path_matrix[currIdx][newIdx] = 1
+            curr_inds = self._node_to_path_indices[currIdx]
+            curr_row = torch.zeros(self._path_matrix.size(1), dtype=self._path_matrix.dtype, device=self.device)
+            if len(curr_inds) > 0:
+                curr_row[torch.tensor(curr_inds, dtype=torch.long, device=self.device)] = 1.0 / float(len(curr_inds))
+            self._path_matrix[currIdx] = curr_row
 
             # specific changes for node 'child'
             self._node_to_path_indices[newChildIdx] = self._node_to_path_indices[newIdx] + [newChildIdx]
-            self._path_matrix[newChildIdx] = self._path_matrix[newIdx]
-            self._path_matrix[newChildIdx][newChildIdx] = 1
+            child_inds = self._node_to_path_indices[newChildIdx]
+            child_row = torch.zeros(self._path_matrix.size(1), dtype=self._path_matrix.dtype, device=self.device)
+            if len(child_inds) > 0:
+                child_row[torch.tensor(child_inds, dtype=torch.long, device=self.device)] = 1.0 / float(len(child_inds))
+            self._path_matrix[newChildIdx] = child_row
 
             self._leaf_idxs[newChildIdx] = 1
 
@@ -328,7 +336,7 @@ class FastCobwebTorchTree(object):
             indices = self._node_to_path_indices[idx]
             if len(indices) > 0:
                 inds = torch.tensor(indices, dtype=torch.long, device=self.device)
-                row[inds] = 1.0
+                row[inds] = 1.0 / float(len(indices))
             self._path_matrix[idx] = row
             self.idx_to_node.append(newChild)
 
@@ -338,7 +346,7 @@ class FastCobwebTorchTree(object):
 
             return newChild
     
-    def fast_categorize(self, instance, leaf=False, k=1):
+    def fast_categorize(self, instance, leaf=False, k=1) -> list:
         """
         An adapted function that uses the CobwebWrapper Pathsum definitions to do prediction!
 
@@ -350,7 +358,7 @@ class FastCobwebTorchTree(object):
         scores = self.fast_categorize_scores(instance)
 
         if scores == []:
-            return self.root
+            return [self.root]
 
         if leaf:
             scores = scores * self._leaf_idxs[:len(self.idx_to_node)]
@@ -372,9 +380,6 @@ class FastCobwebTorchTree(object):
             return topk_nonzero_indices
         
         indices = get_topk_nonzero_indices(scores, k)
-
-        if k == 1:
-            return self.idx_to_node[indices[0]]
 
         return [self.idx_to_node[i] for i in indices]
 
@@ -776,6 +781,89 @@ class FastCobwebTorchTree(object):
             score += (1 / (2 * torch.sqrt(self.pi_tensor) * torch.sqrt(var2))).sum()
 
         return score
+
+    def soft_find_first_new_greedy(self, instance):
+        """
+        Matrix-only soft approximation of `find_first_new_greedy`.
+
+        This function avoids any tree traversal and uses only the
+        procedurally-updated tensors in the class (e.g. `_node_means`,
+        `_node_vars`, `_path_matrix`, and `idx_to_node`) to compute a
+        differentiable / matrix-based approximation of the greedy
+        top-down search that would return the first node along the
+        greedy path whose best action is 'new'.
+
+        Implementation notes / heuristics:
+        - We compute a per-node log-likelihood of the instance under
+            the node's Gaussian (same form used elsewhere in this class),
+            then invert that to obtain a "newiness" score (low likelihood
+            => high newiness).
+        - We aggregate per-node newiness along the stored path matrix
+            using a single matrix multiplication, which simulates the
+            top-down accumulation used by greedy search.
+        - The node with the largest aggregated newiness is returned as
+            the approximated 'first new' node. No loops are used.
+
+        This is an approximation and intentionally conservative — it
+        returns one of the nodes in `idx_to_node` (or `None` if empty).
+
+        Args:
+                instance: tensor instance (same format as used elsewhere)
+                temperature: (unused currently) kept for API compatibility
+
+        Returns:
+                A node from `self.idx_to_node` or `None` if none available.
+        """
+        # Fast-path: nothing to do
+        if len(self.idx_to_node) == 0:
+            return self.root
+
+        # Bring input to the same device
+        x = instance.to(self.device)
+
+        # Work only with active nodes
+        num_nodes = len(self.idx_to_node)
+        node_means = self._node_means[:num_nodes]
+        node_vars = self._node_vars[:num_nodes]
+
+        # Stabilize variances
+        eps = 1e-12
+        node_vars = node_vars.clamp(min=eps)
+
+        # Mahalanobis-like term: (x - mu)^2 / var
+        diff_sq = (x.unsqueeze(0) - node_means) ** 2
+        scaled_diff = diff_sq / node_vars
+        sq_term = scaled_diff.sum(dim=1)
+
+        # Node log-probability (up to constant): -0.5*(log(var).sum + sq_term)
+        log_var_sum = torch.log(node_vars).sum(dim=1)
+        node_log_probs = -0.5 * (log_var_sum + sq_term)
+
+        # Invert log-probs to get a "newiness" score: nodes that fit the
+        # instance poorly (low log-prob) get higher newiness.
+        newiness = -node_log_probs
+
+        # Normalize newiness to avoid scale issues (still pure tensor ops)
+        new_mean = newiness.mean()
+        new_std = newiness.std(unbiased=False)
+        new_std = new_std.clamp(min=eps)
+        newiness = (newiness - new_mean) / new_std
+
+        # Multiply by the path matrix to simulate top-down accumulation.
+        # `_path_matrix` rows correspond to normalized path indicators for
+        # each stored node; slicing matches active nodes.
+        pm = self._path_matrix[:num_nodes, :num_nodes]
+        # aggregated score per stored-node index (pure matmul)
+        agg_scores = pm.matmul(newiness)
+
+        # Choose the best aggregated score's index (no loops) and return node
+        best_idx = int(torch.argmax(agg_scores).item())
+
+        # Guard: if index is out-of-range for any reason, return None
+        if best_idx < 0 or best_idx >= len(self.idx_to_node):
+            return None
+
+        return self.idx_to_node[best_idx]
 
     def analyze_structure(self):
         """

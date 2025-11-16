@@ -273,10 +273,6 @@ class ApproxCobwebWrapper:
         for tnode in self.transition_nodes:
             self.t_hash_to_leaf_idxs[hash(tnode)] = get_leaf_idxs(tnode)
 
-        print("Number of leaves per transition node: ")
-        for tnode in self.transition_nodes:
-            print(hash(tnode), ":", len(self.t_hash_to_leaf_idxs[hash(tnode)]))
-
     def cobweb_predict(self, input, k=5, return_ids=False, is_embedding=False):
         """
         Main two-stage prediction method using configured first_method and
@@ -410,12 +406,6 @@ class ApproxCobwebWrapper:
             leaf=True,
             k=k
         )
-
-        # res = self.tree.categorize(
-        #     x,
-        #     greedy=False,
-        #     retrieve_k=k
-        # )
 
         if return_ids:
             return [i.sentence_id[0] for i in res]
