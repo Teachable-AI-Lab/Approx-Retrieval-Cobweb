@@ -45,6 +45,12 @@ There are many different ways we can choose to implement PQ with Cobweb!
     *   Simply change the categorization logic to PathSum logic
 *   Note that we may even be able to bring back a whole-tree merge split pass-through as we traverse back up the tree
 
+SUCCESS! Below is the implementation:
+*   The BEST/NEW method yields valuable results, and our goal is to implement it in such a way that it can be approximated with a single set of matrix operations
+*   We haven't *exactly* achieved Cobweb from this result, but we've definitely achieved a similar sort of tree structure.
+*   We do this by creating a similar categorization function that operates on the "new-ness" of a given node, trying to find the worst node on the best path.
+    *   For some reason, this is done by inverting 
+
 ## Benchmarks
 
 *   Methods tested against:

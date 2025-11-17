@@ -42,7 +42,7 @@ class BaseBenchmark(ABC):
     def get_benchmark_list(self, method: str = "all") -> List[str]:
         """Get list of benchmark methods to run."""
         if method == "all":
-            return ['FAISS', 'FAISS IVF-PQ', 'Annoy', 'HNSWLib', 'Torch Dot', 'FAISS PCA + ICA', 'Torch PCA + ICA', 'Cobweb PCA + ICA']
+            return ['FAISS', 'FAISS IVF-PQ', 'Annoy', 'HNSWLib', 'Torch Dot', 'FAISS PCA + ICA', "HNWSLib PCA + ICA", 'Cobweb PCA + ICA']
         elif method == "extra":
             return ['FAISS', 'FAISS IVF-PQ', 'Annoy', 'Torch Dot','FAISS PCA + ICA', 'Torch PCA + ICA', 'FAISS L2', 'FAISS L2 PCA + ICA', 
                    'HNSWLib', 'HNSWLib PCA + ICA', 'Cobweb PCA + ICA']
@@ -261,7 +261,7 @@ class BaseBenchmark(ABC):
     
     def run_benchmark(self, model_name: str, subset_size: int = 7500, split: str = "validation",
                      target_size: int = 750, top_k: int = 3, compute: bool = True,
-                     method: str = 'all', **kwargs) -> List[Dict[str, Any]]:
+                     method: str = 'all', visualize=False, **kwargs) -> List[Dict[str, Any]]:
         """
         Run the complete benchmark pipeline.
         

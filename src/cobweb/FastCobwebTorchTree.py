@@ -20,7 +20,7 @@ class FastCobwebTorchTree(object):
     """
 
     def __init__(self, shape, use_info=True, acuity_cutoff=False,
-                 use_kl=True, prior_var=None, alpha=1e-8, device=None, gradient_flow=False, precompute=40000):
+                 use_kl=True, prior_var=None, alpha=1e-8, device=None, gradient_flow=False, precompute=10000):
         """
         The tree constructor.
         """
@@ -54,7 +54,6 @@ class FastCobwebTorchTree(object):
         self.hash_to_idx = {}
         self._node_means = torch.zeros(precompute, self.shape[0], 
                                      device=self.device, dtype=torch.float)
-        # Initialize unused vars to the prior variance to avoid log(0)/div0
         prior_val = (self.prior_var.item() if isinstance(self.prior_var, torch.Tensor)
                      else float(self.prior_var))
         self._node_vars = torch.full((precompute, self.shape[0]), prior_val,
@@ -82,6 +81,7 @@ class FastCobwebTorchTree(object):
         self._node_means = resize_tensor_2d(self._node_means, (new_size, self.shape[0]))
         self._node_vars = resize_tensor_2d(self._node_vars, (new_size, self.shape[0]))
         self._path_matrix = resize_tensor_2d(self._path_matrix, (new_size, new_size))
+        self._leaf_idxs = torch.cat([self._leaf_idxs, torch.zeros(new_size - self._leaf_idxs.shape[0], device=self.device, dtype=self._leaf_idxs.dtype)], dim=0)
 
     def _build_node_map(self):
         """
@@ -208,8 +208,8 @@ class FastCobwebTorchTree(object):
             *   Fringe-Split: We need to create a new parent for the current node and its child
         """
 
-        if len(self.idx_to_node) >= len(self._node_means):
-            self.resize_structs(len(self.idx_to_node) * 2 + 1)
+        if len(self.idx_to_node) >= len(self._node_means) - 1:
+            self.resize_structs(len(self._node_means) * 2 + 1)
 
         def increment_up(current_node):
             # traverse up from the node and increment counts
@@ -324,6 +324,8 @@ class FastCobwebTorchTree(object):
 
         else:
             newChild = current.create_new_child(instance)
+
+            print("NO FRINGE SPLIT")
 
             self.hash_to_idx[hash(newChild)] = len(self.idx_to_node)
 
@@ -728,30 +730,6 @@ class FastCobwebTorchTree(object):
         with torch.no_grad():
             return self._cobweb_categorize(instance, use_best, greedy, max_nodes, retrieve_k)
 
-    def old_categorize(self, instance):
-        """
-        A cobweb specific version of categorize, not intended to be
-        externally called.
-
-        .. seealso:: :meth:`CobwebTree.categorize`
-        """
-        current = self.root
-
-        while True:
-            if (len(current.children) == 0):
-                return current
-
-            parent = current
-            current = None
-            best_score = None
-
-            for child in parent.children:
-                score = child.log_prob_class_given_instance(instance)
-
-                if ((current is None) or ((best_score is None) or (score > best_score))):
-                    best_score = score
-                    current = child
-
     def compute_var(self, meanSq, count):
         # return (meanSq + 30*1) / (count + 30)
 
@@ -784,15 +762,6 @@ class FastCobwebTorchTree(object):
 
     def soft_find_first_new_greedy(self, instance):
         """
-        Matrix-only soft approximation of `find_first_new_greedy`.
-
-        This function avoids any tree traversal and uses only the
-        procedurally-updated tensors in the class (e.g. `_node_means`,
-        `_node_vars`, `_path_matrix`, and `idx_to_node`) to compute a
-        differentiable / matrix-based approximation of the greedy
-        top-down search that would return the first node along the
-        greedy path whose best action is 'new'.
-
         Implementation notes / heuristics:
         - We compute a per-node log-likelihood of the instance under
             the node's Gaussian (same form used elsewhere in this class),
@@ -814,28 +783,22 @@ class FastCobwebTorchTree(object):
         Returns:
                 A node from `self.idx_to_node` or `None` if none available.
         """
-        # Fast-path: nothing to do
         if len(self.idx_to_node) == 0:
             return self.root
 
-        # Bring input to the same device
         x = instance.to(self.device)
 
-        # Work only with active nodes
         num_nodes = len(self.idx_to_node)
         node_means = self._node_means[:num_nodes]
         node_vars = self._node_vars[:num_nodes]
 
-        # Stabilize variances
         eps = 1e-12
         node_vars = node_vars.clamp(min=eps)
 
-        # Mahalanobis-like term: (x - mu)^2 / var
         diff_sq = (x.unsqueeze(0) - node_means) ** 2
         scaled_diff = diff_sq / node_vars
         sq_term = scaled_diff.sum(dim=1)
 
-        # Node log-probability (up to constant): -0.5*(log(var).sum + sq_term)
         log_var_sum = torch.log(node_vars).sum(dim=1)
         node_log_probs = -0.5 * (log_var_sum + sq_term)
 
@@ -843,23 +806,16 @@ class FastCobwebTorchTree(object):
         # instance poorly (low log-prob) get higher newiness.
         newiness = -node_log_probs
 
-        # Normalize newiness to avoid scale issues (still pure tensor ops)
         new_mean = newiness.mean()
         new_std = newiness.std(unbiased=False)
         new_std = new_std.clamp(min=eps)
         newiness = (newiness - new_mean) / new_std
 
-        # Multiply by the path matrix to simulate top-down accumulation.
-        # `_path_matrix` rows correspond to normalized path indicators for
-        # each stored node; slicing matches active nodes.
         pm = self._path_matrix[:num_nodes, :num_nodes]
-        # aggregated score per stored-node index (pure matmul)
         agg_scores = pm.matmul(newiness)
 
-        # Choose the best aggregated score's index (no loops) and return node
         best_idx = int(torch.argmax(agg_scores).item())
 
-        # Guard: if index is out-of-range for any reason, return None
         if best_idx < 0 or best_idx >= len(self.idx_to_node):
             return None
 

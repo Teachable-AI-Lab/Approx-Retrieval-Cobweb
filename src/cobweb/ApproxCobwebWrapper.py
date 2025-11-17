@@ -551,8 +551,8 @@ class ApproxCobwebWrapper:
             label = f"Sentence ID: {getattr(node, 'sentence_id', 'N/A')}"
             print(f"{indent}- Node ID {node.id} {label}")
             sid = getattr(node, "sentence_id", None)
-            if sid is not None and sid < len(self.sentences):
-                sentence = self.sentences[sid]
+            if sid and sid[0] < len(self.sentences):
+                sentence = self.sentences[sid[0]]
                 if sentence is not None:
                     print(f"{indent}    \"{sentence}\"")
                 else:
@@ -568,6 +568,7 @@ class ApproxCobwebWrapper:
         Returns the number of sentences in the Cobweb tree.
         """
         return len(self.sentences)
+
 
     def _visualize_grandparent_tree(self, tree_root, sentences, output_dir="grandparent_trees", num_leaves=6):
 
@@ -675,7 +676,8 @@ class ApproxCobwebWrapper:
 
                     parent_id = local_next_id()
                     node_ids[parent] = parent_id
-                    dot.node(parent_id, "", shape='circle', width='0.25', style='filled', color='#666666')
+                    # Make intermediary (parent) nodes slightly larger and remove text
+                    dot.node(parent_id, "", shape='circle', width='0.35', height='0.35', fixedsize='true', style='filled', color='#666666')
                     dot.edge(gp_node_id, parent_id)
 
                     for leaf in filtered_leaves:
@@ -685,7 +687,8 @@ class ApproxCobwebWrapper:
                             continue  # already filtered, but double-check
 
                         leaf_id = local_next_id()
-                        dot.node(leaf_id, label, shape='box', style='filled', color='lightgrey')
+                        # Make leaf nodes' text dominate: larger font, more margin
+                        dot.node(leaf_id, label, shape='box', style='filled', color='lightgrey', fontsize='16', fontname='Helvetica', margin='0.2,0.1')
                         dot.edge(parent_id, leaf_id)
 
                 filename = get_filename_for_grandparent(grandparent_node, batch_index)
@@ -699,3 +702,200 @@ class ApproxCobwebWrapper:
 
     def visualize_subtrees(self, directory, num_leaves=6):
         self._visualize_grandparent_tree(self.tree.root, self.sentences, directory, num_leaves)
+
+    def visualize_query_subtrees(self, query_embeddings, query_texts=None, directory="query_subtrees", k=6, max_nodes_display=500):
+        """
+        For each query embedding, find top-`k` leaf nodes using `fast_categorize`,
+        compute the minimal subtree that contains all those leaves (union of
+        ancestor paths), and render that subtree to `directory` (one file per query).
+
+        Args:
+            query_embeddings: iterable of embeddings (list, numpy array, or torch tensor).
+            directory: output directory for rendered images.
+            k: number of top leaves to retrieve per query (passed to `fast_categorize`).
+            max_nodes_display: safety cap on number of nodes to render for a single query.
+        """
+
+        os.makedirs(directory, exist_ok=True)
+
+        # Allow passing raw query texts instead of precomputed embeddings.
+        # If `query_embeddings` is a list of strings, treat them as texts and encode.
+        # Otherwise, prefer explicit `query_texts` if provided for labeling.
+        q_texts = None
+        if isinstance(query_embeddings, list) and len(query_embeddings) > 0 and isinstance(query_embeddings[0], str):
+            q_texts = query_embeddings
+            q_embs = self.encode_func(q_texts)
+            if not torch.is_tensor(q_embs):
+                q_embs = torch.tensor(q_embs)
+            q_embs = q_embs.to(self.device)
+        else:
+            # If explicit query_texts provided, keep for labels
+            if query_texts is not None:
+                q_texts = query_texts
+
+            # Normalize numeric embeddings to torch tensor on device
+            if torch.is_tensor(query_embeddings):
+                q_embs = query_embeddings.to(self.device)
+            else:
+                try:
+                    q_embs = torch.tensor(query_embeddings, device=self.device)
+                except Exception:
+                    # Fallback: try encoding if embeddings can't be tensorized
+                    if query_texts is not None:
+                        q_embs = self.encode_func(query_texts)
+                        if not torch.is_tensor(q_embs):
+                            q_embs = torch.tensor(q_embs)
+                        q_embs = q_embs.to(self.device)
+                    else:
+                        raise
+
+        def get_sentence_label(sid, max_len=250, wrap=40):
+            if sid is not None and sid < len(self.sentences):
+                sentence = self.sentences[sid]
+                if sentence:
+                    needs_ellipsis = len(sentence) > max_len
+                    truncated = sentence[:max_len].rstrip()
+                    if needs_ellipsis:
+                        truncated += "..."
+                    # Wrap at word boundaries every ~wrap characters
+                    words = truncated.split()
+                    lines = []
+                    current_line = ""
+                    for word in words:
+                        if len(current_line) + len(word) + 1 > wrap:
+                            lines.append(current_line)
+                            current_line = word
+                        else:
+                            current_line += (" " if current_line else "") + word
+                    if current_line:
+                        lines.append(current_line)
+                    return "\n".join(lines)
+            return None
+
+        # Iterate queries
+        for qi in range(q_embs.shape[0] if q_embs.ndim > 1 else 1):
+            if q_embs.ndim > 1:
+                x = q_embs[qi]
+            else:
+                x = q_embs
+
+            # get top-k leaf nodes via tree categorize
+            try:
+                top_nodes = self.tree.fast_categorize(x, leaf=True, k=k)
+            except Exception as e:
+                print(f"[Warning] fast_categorize failed for query {qi}: {e}")
+                continue
+
+            if not top_nodes:
+                print(f"Query {qi}: no leaves retrieved")
+                continue
+
+            # Collect the actual leaf node objects
+            leaf_nodes = list(top_nodes)
+
+            # For each leaf, collect path of ancestors up to root
+            nodes_in_subtree = set()
+            parent_map = {}
+
+            for leaf in leaf_nodes:
+                curr = leaf
+                prev = None
+                while curr is not None:
+                    nodes_in_subtree.add(curr)
+                    # remember parent->child mapping for edges
+                    par = getattr(curr, 'parent', None)
+                    if par is not None:
+                        if par not in parent_map:
+                            parent_map[par] = set()
+                        parent_map[par].add(curr)
+                    prev = curr
+                    curr = getattr(curr, 'parent', None)
+
+            if len(nodes_in_subtree) == 0:
+                print(f"Query {qi}: empty subtree")
+                continue
+
+            if len(nodes_in_subtree) > max_nodes_display:
+                print(f"Query {qi}: subtree too large ({len(nodes_in_subtree)} nodes), skipping render")
+                continue
+
+            # Render subtree with graphviz
+            dot = Digraph(comment=f"Query_{qi}_Subtree", format='png')
+            dot.attr(rankdir='TB')
+            dot.attr('edge', color='lightblue')
+
+            # Create a small boxed node for the query text in the top corner.
+            label_text = None
+            if q_texts is not None and qi < len(q_texts):
+                label_text = q_texts[qi]
+            if label_text is None:
+                label_text = f"<embedding_{qi}>"
+
+            # Truncate and wrap label to reasonable length and line width
+            def wrap_query_text(text, max_len=200, wrap=40):
+                if text is None:
+                    return "Query:"
+                needs_ellipsis = len(text) > max_len
+                truncated = text[:max_len].rstrip()
+                if needs_ellipsis:
+                    truncated += "..."
+                words = truncated.split()
+                lines = []
+                current_line = ""
+                for word in words:
+                    if len(current_line) + len(word) + (1 if current_line else 0) > wrap:
+                        lines.append(current_line)
+                        current_line = word
+                    else:
+                        current_line += (" " if current_line else "") + word
+                if current_line:
+                    lines.append(current_line)
+                if not lines:
+                    return "Query:"
+                # Put 'Query:' on its own first line so the message wraps below it
+                return "Query:\n" + "\n".join(lines)
+
+            wrapped_label = wrap_query_text(label_text, max_len=200, wrap=40)
+
+            # Place the query label inside a tiny top-ranked subgraph so it sits at the top.
+            qnode_name = f"q{qi}_label"
+            with dot.subgraph(name=f"cluster_q_{qi}") as c:
+                c.attr(rank='min')
+                c.node(qnode_name, wrapped_label, shape='box', fontsize='12', fontname='Helvetica', style='filled,rounded', fillcolor='lightyellow', margin='0.08,0.05')
+
+            node_ids = {}
+            local_counter = {"id": 0}
+
+            def local_next_id():
+                local_counter["id"] += 1
+                return f"n{local_counter['id']}"
+
+            # Create nodes
+            for node in nodes_in_subtree:
+                nid = local_next_id()
+                node_ids[node] = nid
+                sid = getattr(node, 'sentence_id', None)
+                # If node is a leaf with sentence, label it; otherwise small circle
+                if sid and isinstance(sid, list) and len(sid) and sid[0] is not None and sid[0] < len(self.sentences):
+                    label = get_sentence_label(sid[0])
+                    if not label:
+                        label = "[Embedding only]"
+                    # Leaf node: emphasize text, larger font and margin
+                    dot.node(nid, label, shape='box', style='filled', color='lightgrey', fontsize='16', fontname='Helvetica', margin='0.2,0.1')
+                else:
+                    # internal node: remove text and make it slightly larger so leaves dominate visually
+                    dot.node(nid, "", shape='circle', width='0.35', height='0.35', fixedsize='true', style='filled', color='#ccccff')
+
+            # Create edges only where both parent and child are in subtree
+            for parent, children in parent_map.items():
+                if parent not in node_ids:
+                    continue
+                for child in children:
+                    if child not in node_ids:
+                        continue
+                    dot.edge(node_ids[parent], node_ids[child])
+
+            filename = os.path.join(directory, f"query_{qi}_subtree.png")
+            filepath = os.path.join(directory, f"query_{qi}_subtree")
+            dot.render(filepath, cleanup=True)
+            print(f"Saved: {filename}")
