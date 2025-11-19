@@ -407,6 +407,11 @@ class ApproxCobwebWrapper:
             k=k
         )
 
+        # res = self.tree.categorize(
+        #     x,
+        #     retrieve_k=k
+        # )
+
         if return_ids:
             return [i.sentence_id[0] for i in res]
         else:
@@ -568,140 +573,6 @@ class ApproxCobwebWrapper:
         Returns the number of sentences in the Cobweb tree.
         """
         return len(self.sentences)
-
-
-    def _visualize_grandparent_tree(self, tree_root, sentences, output_dir="grandparent_trees", num_leaves=6):
-
-        os.makedirs(output_dir, exist_ok=True)
-
-        def get_sentence_label(sid, max_len=250, wrap=40):
-            if sid is not None and sid < len(sentences):
-                sentence = sentences[sid]
-                if sentence:
-                    needs_ellipsis = len(sentence) > max_len
-                    truncated = sentence[:max_len].rstrip()
-                    if needs_ellipsis:
-                        truncated += "..."
-                    # Wrap at word boundaries every ~wrap characters
-                    words = truncated.split()
-                    lines = []
-                    current_line = ""
-                    for word in words:
-                        if len(current_line) + len(word) + 1 > wrap:
-                            lines.append(current_line)
-                            current_line = word
-                        else:
-                            current_line += (" " if current_line else "") + word
-                    if current_line:
-                        lines.append(current_line)
-                    return "\n".join(lines)
-            return None
-
-
-        def is_leaf_with_sentence(node):
-            sid = getattr(node, "sentence_id", None)
-            return get_sentence_label(sid) is not None
-
-        def is_grandparent(node):
-            # A grandparent is a node whose children have children (i.e., grandchildren exist)
-            return any(
-                child and getattr(child, "children", None)
-                for child in getattr(node, "children", [])
-            )
-
-        def collect_grandparents(node):
-            result = []
-            if is_grandparent(node):
-                # Only include this grandparent if it has leaf descendants with valid sentences
-                valid_leaf_count = sum(
-                    is_leaf_with_sentence(leaf)
-                    for child in getattr(node, "children", [])
-                    for leaf in getattr(child, "children", [])
-                )
-                if valid_leaf_count > 0:
-                    result.append(node)
-            for child in getattr(node, "children", []):
-                result.extend(collect_grandparents(child))
-            return result
-
-        def get_filename_for_grandparent(node, index=0):
-            sid = getattr(node, "sentence_id", None)
-            if sid is not None and sid < len(sentences):
-                sentence = sentences[sid]
-                if sentence:
-                    short_hash = hashlib.sha1(sentence.encode()).hexdigest()[:8]
-                    return f"gp_{sid}_{short_hash}_{index}.png"
-            return f"gp_node_{getattr(node, 'id', 'unknown')}_{index}.png"
-
-        def process_subtree(grandparent_node):
-            all_leaves = []
-            parent_map = {}
-
-            # First collect only parents/leaves with valid sentences
-            for parent in getattr(grandparent_node, "children", []):
-                valid_leaves = [leaf for leaf in getattr(parent, "children", []) if is_leaf_with_sentence(leaf)]
-                if valid_leaves:
-                    parent_map[parent] = valid_leaves
-                    all_leaves.extend(valid_leaves)
-
-            if not all_leaves:
-                return  # No valid subtree to render
-
-            # Split leaves into batches of 6
-            leaf_batches = [all_leaves[i:i + num_leaves] for i in range(0, len(all_leaves), 6)]
-
-            for batch_index, batch in enumerate(leaf_batches):
-                dot = Digraph(comment="Grandparent Subtree", format='png')
-                dot.attr(rankdir='TB')
-                dot.attr('edge', color='lightblue')
-
-                node_ids = {}
-                local_counter = {"id": 0}
-
-                def local_next_id():
-                    local_counter["id"] += 1
-                    return f"n{local_counter['id']}"
-
-                # Grandparent node
-                gp_node_id = local_next_id()
-                node_ids[grandparent_node] = gp_node_id
-                dot.node(gp_node_id, "", shape='circle', width='0.5', style='filled', color='lightblue')
-
-                # Include only relevant parents and children
-                for parent, leaves in parent_map.items():
-                    # Only include this parent if it has leaves in current batch
-                    filtered_leaves = [leaf for leaf in leaves if leaf in batch]
-                    if not filtered_leaves:
-                        continue
-
-                    parent_id = local_next_id()
-                    node_ids[parent] = parent_id
-                    # Make intermediary (parent) nodes slightly larger and remove text
-                    dot.node(parent_id, "", shape='circle', width='0.35', height='0.35', fixedsize='true', style='filled', color='#666666')
-                    dot.edge(gp_node_id, parent_id)
-
-                    for leaf in filtered_leaves:
-                        sid = getattr(leaf, "sentence_id", None)
-                        label = get_sentence_label(sid)
-                        if not label:
-                            continue  # already filtered, but double-check
-
-                        leaf_id = local_next_id()
-                        # Make leaf nodes' text dominate: larger font, more margin
-                        dot.node(leaf_id, label, shape='box', style='filled', color='lightgrey', fontsize='16', fontname='Helvetica', margin='0.2,0.1')
-                        dot.edge(parent_id, leaf_id)
-
-                filename = get_filename_for_grandparent(grandparent_node, batch_index)
-                filepath = os.path.join(output_dir, filename)
-                dot.render(filepath, cleanup=True)
-                print(f"Saved: {filepath}")
-
-        grandparents = collect_grandparents(tree_root)
-        for gp in grandparents:
-            process_subtree(gp)
-
-    def visualize_subtrees(self, directory, num_leaves=6):
-        self._visualize_grandparent_tree(self.tree.root, self.sentences, directory, num_leaves)
 
     def visualize_query_subtrees(self, query_embeddings, query_texts=None, directory="query_subtrees", k=6, max_nodes_display=500):
         """
@@ -875,7 +746,7 @@ class ApproxCobwebWrapper:
                 nid = local_next_id()
                 node_ids[node] = nid
                 sid = getattr(node, 'sentence_id', None)
-                # If node is a leaf with sentence, label it; otherwise small circle
+                # If node is a leaf with sentence, label it; otherwise show depth
                 if sid and isinstance(sid, list) and len(sid) and sid[0] is not None and sid[0] < len(self.sentences):
                     label = get_sentence_label(sid[0])
                     if not label:
@@ -883,8 +754,27 @@ class ApproxCobwebWrapper:
                     # Leaf node: emphasize text, larger font and margin
                     dot.node(nid, label, shape='box', style='filled', color='lightgrey', fontsize='16', fontname='Helvetica', margin='0.2,0.1')
                 else:
-                    # internal node: remove text and make it slightly larger so leaves dominate visually
-                    dot.node(nid, "", shape='circle', width='0.35', height='0.35', fixedsize='true', style='filled', color='#ccccff')
+                    # internal node: label with its depth from the root and make it slightly larger
+                    # Compute depth by walking up parents until root (root has depth 0)
+                    depth = 0
+                    curr_depth_node = node
+                    while getattr(curr_depth_node, 'parent', None) is not None:
+                        depth += 1
+                        curr_depth_node = getattr(curr_depth_node, 'parent')
+
+                    depth_label = str(depth)
+                    dot.node(
+                        nid,
+                        depth_label,
+                        shape='circle',
+                        width='0.35',
+                        height='0.35',
+                        fixedsize='true',
+                        style='filled',
+                        color='#ccccff',
+                        fontsize='10',
+                        fontname='Helvetica'
+                    )
 
             # Create edges only where both parent and child are in subtree
             for parent, children in parent_map.items():
